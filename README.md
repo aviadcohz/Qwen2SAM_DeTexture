@@ -61,16 +61,16 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
     |  Output: text descriptions |                   |
     |  with <TEX_i> markers      |                   |
     +-------------+--------------+                   |
-                  |                                   |
-                  v                                   |
+                  |                                  |
+                  v                                  |
     +----------------------------+                   |
     |  Extract <TEX_i> hidden    |                   |
     |  states (single token each)|                   |
     |                            |                   |
     |  K vectors of dim 2048     |                   |
     +-------------+--------------+                   |
-                  |                                   |
-                  v                                   |
+                  |                                  |
+                  v                                  |
     +----------------------------+                   |
     |  Build 6 Query Slots       |                   |
     |                            |                   |
@@ -79,22 +79,22 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
     |                            |                   |
     |  6 vectors of dim 2048     |                   |
     +-------------+--------------+                   |
-                  |                                   |
-                  v                                   |
+                  |                                  |
+                  v                                  |
     +----------------------------+                   |
     |  MODULE B: MLP Projector   |                   |
     |  (trainable from scratch)  |                   |
     |                            |                   |
-    |  2048 -> 1024 + LN + GELU |                   |
-    |  1024 -> 512 + GELU       |                   |
-    |  512  -> 256              |                   |
+    |  2048 -> 1024 + LN + GELU  |                   |
+    |  1024 -> 512 + GELU        |                   |
+    |  512  -> 256               |                   |
     |                            |                   |
     |  6 vectors of dim 256      |                   |
     +-------------+--------------+                   |
-                  |                                   |
-                  +-----------------------------------+
-                  |                                   |
-                  v                                   v
+                  |                                  |
+                  +----------------------------------+
+                  |                                  |
+                  v                                  v
     +-------------------------------------------------------+
     |  MODULE C: SAM3 Semantic Path (SINGLE BATCHED PASS)    |
     |                                                        |
@@ -119,9 +119,9 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
     |  query_proj = MLP(queries)        -> (B, 6, 256)       |
     |  pixel_proj = Conv1x1(pixel_embed) -> (B, 256, H, W)   |
     |                                                        |
-    |  mask_logits = einsum("bqc, bchw -> bqhw")            |
+    |  mask_logits = einsum("bqc, bchw -> bqhw")             |
     |                                                        |
-    |  Output: (B, 6, H, W) raw logits                      |
+    |  Output: (B, 6, H, W) raw logits                       |
     |    Channel 0: DUSTBIN (background/objects)             |
     |    Channels 1-K: Texture regions                       |
     |    Channels K+1 to 5: PAD (masked to -inf)             |
