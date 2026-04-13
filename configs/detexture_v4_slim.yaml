@@ -3,19 +3,9 @@ seed: 42
 model:
   qwen_model: "Qwen/Qwen3-VL-8B-Instruct"
   qwen_dtype: "bfloat16"
-  gradient_checkpointing: true
 
-  # V5 Qwen LoRA — lightweight, trained via [SEG]-only loss masking
-  lora_r: 8
-  lora_alpha: 16
-  lora_dropout: 0.0
-  lora_target_modules: ["q_proj", "v_proj"]
-
-  # V5 Bottleneck Projector (4096 → 512 → 256)
-  projector_hidden_dim: 512
-
-  # Differential LR: Qwen LoRA gets base_lr * qwen_lr_scale (conservative)
-  qwen_lr_scale: 0.2       # 1e-4 * 0.2 = 2e-5 for Qwen LoRA
+  # V4-Slim: Bottleneck at 512 dims (vs V4's 2048→1024 = 10.5M)
+  projector_bottleneck_dim: 512     # 4096→512→1024→plug(1024→256) = ~2.6M trainable
 
   # SAM3
   sam3_checkpoint: null
@@ -31,6 +21,7 @@ model:
 data:
   train_metadata: "/home/aviad/datasets/ADE20K_textured_images/train_metadata.json"
   val_metadata: "/home/aviad/datasets/ADE20K_textured_images/val_metadata.json"
+  qwen_gt_embeds_path: "/home/aviad/datasets/ADE20K_textured_images/qwen_gt_embeds_v4.pt"
   image_size: 1008
   augment: true
   num_workers: 0
@@ -38,34 +29,32 @@ data:
 training:
   batch_size: 2
   gradient_accumulation_steps: 4
-  num_epochs: 60
+  num_epochs: 10          # Short run — just need ep5 vs ep10 comparison
   learning_rate: 1.0e-4
   weight_decay: 0.01
-  warmup_epochs: 5
+  warmup_epochs: 3
   min_lr: 1.0e-6
   max_grad_norm: 1.0
 
-  checkpoint_dir: "checkpoints"
+  checkpoint_dir: "checkpoints_v4_slim"
   save_every: 5
 
-# V5 Three-Stage Curriculum (Cold Start Protection)
+# V4-Slim: Same 2-stage as V4 (projector only → SAM LoRA)
 curriculum:
-  projector_warmup_epochs: 2    # Stage 1: only projector trains (Qwen LoRA frozen)
-  e2e_epoch: 5                  # Stage 3: SAM LoRA unfreezes for end-to-end
+  alignment_epochs: 10    # Keep SAM LoRA frozen for the full 10-epoch run
 
 loss:
   mask_weight: 1.0
   ce_weight: 1.0
   dice_weight: 3.0
-  lm_weight: 0.1        # Minimal — only [SEG] token prediction (labels mask text)
+  distillation_weight: 1.0   # Cosine distillation vs SAM text encoder
   orthogonal_weight: 0.01
 
-# Monitoring & test evaluation
+# Monitoring
 monitor:
-  skip_sanity_check: true     # V5 uses live Qwen forward, not pre-computed GT embeds
-  log_dir: "checkpoints/logs"
-  plot_dir: "checkpoints/plots"
+  log_dir: "checkpoints_v4_slim/logs"
+  plot_dir: "checkpoints_v4_slim/plots"
   test_metadata: "/home/aviad/datasets/RWTD/metadata.json"
   test_eval_every: 5
-  test_output_dir: "checkpoints/test_results"
+  test_output_dir: "checkpoints_v4_slim/test_results"
   baseline_results: "/home/aviad/sam3_detexture_comparison/eval_results_rwtd/results.json"

@@ -1,18 +1,25 @@
 """
-Qwen2SAM-DeTexture: End-to-End VLM-Guided Multi-Texture Segmentation.
+Qwen2SAM-DeTexture V5: End-to-End VLM-Guided Multi-Texture Segmentation.
 
-Architecture:
-  Qwen2.5-VL (frozen + LoRA) → generates texture descriptions with <TEX_i> tokens
-    → Extract single hidden state at each <TEX_i> position
-    → Build 6 query slots: [DUSTBIN, TEX_1, ..., TEX_K, PAD...]
-    → MLP Projector (2048 → 1024 → 512 → 256)
-    → Single batched pass through SAM3:
-        Fusion Encoder (frozen + Orthogonal LoRA) with (B, 6, 256) as prompt
+Architecture (V5 — [SEG] Token + Bottleneck Projector):
+  Qwen3-VL-8B (LoRA r=8) → generates "TEXTURE_N: <desc> <|seg|>" lines
+    → Extract hidden state at each <|seg|> token position
+    → Build 7 query slots: [DUSTBIN, SEG_1, ..., SEG_K, PAD...]
+    → Bottleneck Projector (4096 → 512 → 256)   [~2M params]
+    → Batch Multiplexed pass through SAM3:
+        Fusion Encoder (frozen + Orthogonal LoRA)
       → SegHead cross_attend_prompt (frozen + Orthogonal LoRA)
       → Pixel Decoder (frozen) → pixel_embed (B, 256, H, W)
-      → Multi-texture mask head: einsum(queries, pixel_embed) → (B, 6, H, W)
+      → Multi-texture mask head: einsum(queries, pixel_embed) → (B, 7, H, W)
 
-Channel layout: [0=DUSTBIN, 1..K=textures, K+1..5=PAD]
+Key V5 changes vs V4:
+  - [SEG] token decouples visual grounding from language context
+  - Qwen LoRA (r=8) trained with loss masking (-100 on text, CE only on [SEG])
+  - Bottleneck projector (~2M params) prevents domain-specific overfitting
+  - No Architectural Plug, no distillation loss — mask loss is the sole signal
+  - Gradient flow: Mask Loss → SAM → Projector → [SEG] hidden states → Qwen LoRA
+
+Channel layout: [0=DUSTBIN, 1..K=textures, K+1..6=PAD]
 """
 
 import torch
@@ -28,10 +35,10 @@ from models.orthogonal_lora import apply_orthogonal_lora_to_mha, OrthogonalLoRAL
 #  Constants                                                              #
 # ===================================================================== #
 
-MAX_TEXTURES = 5
-NUM_QUERY_SLOTS = MAX_TEXTURES + 1  # 5 textures + 1 dustbin = 6
+MAX_TEXTURES = 6
+NUM_QUERY_SLOTS = MAX_TEXTURES + 1  # 6 textures + 1 dustbin = 7
 
-TEX_TOKENS = [f"<TEX_{i}>" for i in range(1, MAX_TEXTURES + 1)]
+SEG_TOKEN = "<|seg|>"
 
 
 # ===================================================================== #
@@ -42,38 +49,25 @@ class MultiTextureMaskHead(nn.Module):
     """
     Dot-product mask head: projects queries and pixel features into a shared
     space, then computes masks via einsum.
-
-    Mimics SAM3's MaskPredictor but with our 6 query vectors.
     """
 
     def __init__(self, embed_dim: int = 256, mask_dim: int = 256):
         super().__init__()
-        # Project query vectors
         self.query_mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, mask_dim),
         )
-        # Project pixel embeddings
         self.pixel_head = nn.Conv2d(embed_dim, mask_dim, kernel_size=1)
 
-    def forward(self, queries: torch.Tensor,
-                pixel_embed: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            queries: (B, 6, embed_dim) — the 6 query vectors.
-            pixel_embed: (B, embed_dim, H, W) — pixel features from PixelDecoder.
-
-        Returns:
-            mask_logits: (B, 6, H, W) — raw logits.
-        """
-        q = self.query_mlp(queries)          # (B, 6, mask_dim)
+    def forward(self, queries, pixel_embed):
+        q = self.query_mlp(queries)          # (B, N, mask_dim)
         p = self.pixel_head(pixel_embed)     # (B, mask_dim, H, W)
         return torch.einsum("bqc, bchw -> bqhw", q, p)
 
 
 # ===================================================================== #
-#  Qwen utilities (standalone — no cross-project imports)                 #
+#  Qwen utilities                                                         #
 # ===================================================================== #
 
 def load_qwen_processor(model_name: str):
@@ -89,10 +83,11 @@ def load_qwen_model(model_name: str, dtype=torch.bfloat16):
 
 
 def apply_qwen_lora(model, cfg: dict):
+    """Apply lightweight LoRA to Qwen for [SEG] token training."""
     from peft import LoraConfig, get_peft_model
     lora_config = LoraConfig(
-        r=cfg.get("lora_r", 16),
-        lora_alpha=cfg.get("lora_alpha", 32),
+        r=cfg.get("lora_r", 8),
+        lora_alpha=cfg.get("lora_alpha", 16),
         lora_dropout=cfg.get("lora_dropout", 0.0),
         target_modules=cfg.get("lora_target_modules", ["q_proj", "v_proj"]),
         bias="none",
@@ -101,14 +96,15 @@ def apply_qwen_lora(model, cfg: dict):
     return get_peft_model(model, lora_config)
 
 
-def add_tex_tokens(processor, model):
-    """Add <TEX_1> through <TEX_5> special tokens."""
+def add_seg_token(processor, model):
+    """Add the <|seg|> special token to the tokenizer and resize embeddings."""
     tokenizer = processor.tokenizer
-    num_added = tokenizer.add_tokens(TEX_TOKENS, special_tokens=True)
+    num_added = tokenizer.add_tokens([SEG_TOKEN], special_tokens=True)
     if num_added > 0:
         model.resize_token_embeddings(len(tokenizer))
-    ids = {t: tokenizer.convert_tokens_to_ids(t) for t in TEX_TOKENS}
-    return ids
+    seg_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
+    print(f"  [SEG] token: '{SEG_TOKEN}' → id {seg_id}")
+    return seg_id
 
 
 # ===================================================================== #
@@ -140,10 +136,12 @@ def load_sam3(model_cfg: dict, device):
 
 class Qwen2SAMDeTexture(nn.Module):
     """
-    End-to-End multi-texture segmentation model.
+    V5 End-to-End multi-texture segmentation model.
 
-    Combines Qwen2.5-VL (text generation) with SAM3 (segmentation) to
-    produce K+1 masks (K textures + dustbin) from a single image.
+    Qwen3-VL-8B generates texture descriptions with <|seg|> tokens.
+    LoRA (r=8) is trained with loss masking: -100 on all text tokens,
+    CE only on <|seg|> tokens. Segmentation gradients flow back through
+    the bottleneck projector into the <|seg|> hidden states and Qwen LoRA.
     """
 
     def __init__(self, cfg: dict, device: str = "cuda"):
@@ -152,16 +150,15 @@ class Qwen2SAMDeTexture(nn.Module):
         self.cfg = cfg
         model_cfg = cfg["model"]
 
-        # ---- Qwen2.5-VL ------------------------------------------------ #
+        # ---- Qwen3-VL with LoRA ---------------------------------------- #
         qwen_dtype = getattr(torch, model_cfg.get("qwen_dtype", "bfloat16"))
         self.processor = load_qwen_processor(model_cfg["qwen_model"])
         self.qwen = load_qwen_model(model_cfg["qwen_model"], dtype=qwen_dtype)
 
-        # Add TEX tokens
-        self.tex_token_ids = add_tex_tokens(self.processor, self.qwen)
-        self.tex_id_list = [self.tex_token_ids[t] for t in TEX_TOKENS]
+        # Add [SEG] token
+        self.seg_token_id = add_seg_token(self.processor, self.qwen)
 
-        # Apply LoRA to Qwen
+        # Apply lightweight LoRA (r=8) — trained via [SEG]-only loss masking
         self.qwen = apply_qwen_lora(self.qwen, model_cfg)
         if model_cfg.get("gradient_checkpointing", True):
             self.qwen.enable_input_require_grads()
@@ -176,11 +173,12 @@ class Qwen2SAMDeTexture(nn.Module):
 
         # ---- LLM dim --------------------------------------------------- #
         qwen_cfg = getattr(self.qwen.config, "text_config", self.qwen.config)
-        self.llm_dim = qwen_cfg.hidden_size  # 2048 for Qwen2.5-VL-3B
+        self.llm_dim = qwen_cfg.hidden_size  # 4096 for Qwen3-VL-8B
 
-        # ---- MLP Projector ---------------------------------------------- #
+        # ---- V5 Bottleneck Projector ------------------------------------ #
         self.projector = DescriptionProjector(
             llm_dim=self.llm_dim, sam_dim=256,
+            hidden_dim=model_cfg.get("projector_hidden_dim", 512),
         ).to(self.device)
 
         # ---- Learnable DUSTBIN embedding -------------------------------- #
@@ -193,29 +191,15 @@ class Qwen2SAMDeTexture(nn.Module):
             embed_dim=256, mask_dim=256,
         ).to(self.device)
 
-        # ---- Text alignment head (for contrastive loss) ----------------- #
-        clip_dim = model_cfg.get("clip_dim", 512)
-        if clip_dim > 0:
-            self.text_align_head = nn.Linear(self.llm_dim, clip_dim).to(self.device)
-        else:
-            self.text_align_head = None
-
     # ------------------------------------------------------------------ #
     #  SAM3 freezing + Orthogonal LoRA                                     #
     # ------------------------------------------------------------------ #
 
     def _freeze_sam3(self):
-        """Freeze ALL SAM3 parameters."""
         for param in self.sam3.parameters():
             param.requires_grad = False
 
     def _apply_sam3_orthogonal_lora(self, model_cfg: dict) -> list:
-        """
-        Apply Orthogonal LoRA to the Fusion Encoder's cross-attention layers
-        and the SegHead's cross_attend_prompt.
-
-        Returns list of all OrthogonalLoRALinear modules for penalty collection.
-        """
         r = model_cfg.get("sam3_lora_r", 8)
         alpha = model_cfg.get("sam3_lora_alpha", 16.0)
         n_sing = model_cfg.get("sam3_lora_n_singular", 32)
@@ -223,7 +207,6 @@ class Qwen2SAMDeTexture(nn.Module):
 
         all_lora_modules = []
 
-        # 1. Fusion Encoder layers — cross_attn_image (image ↔ text prompt)
         for layer in self.sam3.transformer.encoder.layers:
             if hasattr(layer, "cross_attn_image"):
                 mha = layer.cross_attn_image
@@ -233,7 +216,6 @@ class Qwen2SAMDeTexture(nn.Module):
                 )
                 all_lora_modules.extend(lora_dict.values())
 
-        # 2. SegHead cross_attend_prompt
         seg_head = self.sam3.segmentation_head
         if seg_head is not None and hasattr(seg_head, "cross_attend_prompt"):
             if seg_head.cross_attend_prompt is not None:
@@ -245,99 +227,174 @@ class Qwen2SAMDeTexture(nn.Module):
 
         n_lora = len(all_lora_modules)
         n_params = sum(
-            p.numel() for m in all_lora_modules
-            for p in [m.lora_A, m.lora_B]
+            p.numel() for m in all_lora_modules for p in [m.lora_A, m.lora_B]
         )
-        print(f"  Orthogonal LoRA: {n_lora} modules, {n_params:,} params")
+        print(f"  SAM3 Orthogonal LoRA: {n_lora} modules, {n_params:,} params")
         return all_lora_modules
 
     # ------------------------------------------------------------------ #
-    #  Token extraction                                                    #
+    #  V5 Block-Diagonal Attention Mask (Anti-Context-Leakage)             #
     # ------------------------------------------------------------------ #
 
-    def extract_tex_hidden_states(
+    def create_independent_texture_mask(self, input_ids):
+        """
+        Build a block-diagonal attention mask that prevents TEXTURE_i's tokens
+        (including <|seg|>_i) from attending to any TEXTURE_j tokens (j < i).
+
+        All texture blocks CAN attend to the shared prefix (system + image +
+        user + assistant header). Within each block, standard causal attention
+        applies. Cross-block attention is strictly blocked.
+
+        This eliminates Context Leakage where <|seg|>_2's hidden state absorbs
+        semantic noise from TEXTURE_1's description, which was proven to inflate
+        cosine similarity from ~0.16 to ~0.74 and cause Directional Drift.
+
+        Args:
+            input_ids: (B, L) token IDs (teacher-forced or generated).
+
+        Returns:
+            (B, 1, L, L) float attention mask. 0.0 = attend, -65504 = block.
+            Compatible with HuggingFace's 4D mask convention (returned as-is
+            by create_causal_mask when it detects a 4D input).
+        """
+        B, L = input_ids.shape
+        device = input_ids.device
+        # Use bf16-safe min value (not -inf, avoids NaN in softmax edge cases)
+        BLOCK_VAL = torch.finfo(torch.bfloat16).min  # -65504
+
+        # Start with standard causal mask: upper triangle blocked
+        mask = torch.zeros(B, 1, L, L, device=device, dtype=torch.bfloat16)
+        causal_block = torch.triu(
+            torch.full((L, L), BLOCK_VAL, device=device, dtype=torch.bfloat16),
+            diagonal=1,
+        )
+        mask += causal_block.unsqueeze(0).unsqueeze(0)  # broadcast to (B, 1, L, L)
+
+        # Cache the <|im_start|> token ID for finding assistant boundary
+        im_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+
+        for b in range(B):
+            ids = input_ids[b]
+
+            # Find <|seg|> positions — each marks the END of a texture block
+            seg_positions = (ids == self.seg_token_id).nonzero(as_tuple=True)[0]
+            K = seg_positions.shape[0]
+            if K < 2:
+                continue  # 0-1 textures → no cross-block leakage possible
+
+            # Find where assistant content begins.
+            # In Qwen3-VL chat template: ...<|im_start|>assistant\nTEXTURE_1: ...
+            # The last <|im_start|> before the first <|seg|> marks the assistant turn.
+            first_seg = seg_positions[0].item()
+            im_starts = (ids == im_start_id).nonzero(as_tuple=True)[0]
+            asst_content_start = 0
+            for pos in reversed(im_starts.tolist()):
+                if pos < first_seg:
+                    # Skip past "<|im_start|>assistant\n" — typically 3-4 tokens.
+                    # Scan forward for the newline token that ends the header.
+                    asst_content_start = pos + 1
+                    for skip_pos in range(pos + 1, min(pos + 8, L)):
+                        tok_str = self.processor.tokenizer.decode(
+                            [ids[skip_pos].item()], skip_special_tokens=False,
+                        )
+                        if "\n" in tok_str:
+                            asst_content_start = skip_pos + 1
+                            break
+                    break
+
+            # Build texture block boundaries:
+            # Block k spans from block_start to seg_positions[k] (inclusive).
+            # Block 0: asst_content_start to seg_positions[0]
+            # Block k (k>=1): seg_positions[k-1]+1 to seg_positions[k]
+            blocks = []
+            for k in range(K):
+                start = asst_content_start if k == 0 else seg_positions[k - 1].item() + 1
+                end = seg_positions[k].item()  # inclusive
+                if start <= end:
+                    blocks.append((start, end))
+
+            # Apply the block-diagonal constraint:
+            # For block k (k >= 1), BLOCK attention to all tokens in blocks 0..k-1.
+            for k in range(1, len(blocks)):
+                row_start, row_end = blocks[k]
+                for prev in range(k):
+                    col_start, col_end = blocks[prev]
+                    mask[b, 0, row_start:row_end + 1, col_start:col_end + 1] = BLOCK_VAL
+
+            # Also block padding tokens (where input_ids == pad_token_id)
+            pad_token_id = self.processor.tokenizer.pad_token_id
+            if pad_token_id is not None:
+                pad_positions = (ids == pad_token_id)
+                if pad_positions.any():
+                    mask[b, 0, :, pad_positions] = BLOCK_VAL
+                    mask[b, 0, pad_positions, :] = BLOCK_VAL
+
+        return mask
+
+    # ------------------------------------------------------------------ #
+    #  V5 [SEG] token extraction                                           #
+    # ------------------------------------------------------------------ #
+
+    def extract_seg_hidden_states(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> tuple:
         """
-        Extract the single hidden state at each <TEX_i> token position.
+        Extract hidden states at <|seg|> token positions.
 
-        Causal LMs concentrate context in the final token of each description,
-        which is the <TEX_i> marker appended at the end.
+        Clean and deterministic — no regex, no line parsing, no truncation
+        edge cases. Works identically at training and inference time.
 
         Args:
             hidden_states: (B, seq_len, llm_dim) from Qwen last layer.
             input_ids: (B, seq_len) token IDs.
 
         Returns:
-            tex_embeds: (B, 5, llm_dim) — hidden states at TEX tokens (zero for missing).
-            k_preds: (B,) — number of TEX tokens found per sample.
+            seg_embeds: (B, MAX_TEXTURES, llm_dim) hidden states at [SEG] tokens.
+            k_preds: (B,) number of [SEG] tokens found per sample.
         """
         B = hidden_states.shape[0]
-        tex_embeds = torch.zeros(B, MAX_TEXTURES, self.llm_dim,
+        seg_embeds = torch.zeros(B, MAX_TEXTURES, self.llm_dim,
                                  device=hidden_states.device,
                                  dtype=hidden_states.dtype)
         k_preds = torch.zeros(B, dtype=torch.long, device=hidden_states.device)
 
         for b in range(B):
-            ids = input_ids[b]
-            count = 0
-            for i, tex_id in enumerate(self.tex_id_list):
-                positions = (ids == tex_id).nonzero(as_tuple=True)[0]
-                if len(positions) > 0:
-                    # Take the first (and should be only) occurrence
-                    pos = positions[0].item()
-                    tex_embeds[b, i] = hidden_states[b, pos]
-                    count = i + 1  # TEX tokens are sequential
-            k_preds[b] = count
+            positions = (input_ids[b] == self.seg_token_id).nonzero(as_tuple=True)[0]
+            k = min(len(positions), MAX_TEXTURES)
+            for i in range(k):
+                seg_embeds[b, i] = hidden_states[b, positions[i]]
+            k_preds[b] = k
 
-        return tex_embeds, k_preds
+        return seg_embeds, k_preds
 
     # ------------------------------------------------------------------ #
     #  Query slot assembly                                                 #
     # ------------------------------------------------------------------ #
 
-    def build_query_slots(
-        self,
-        tex_embeds: torch.Tensor,
-        k_preds: torch.Tensor,
-    ) -> tuple:
+    def build_query_slots(self, seg_embeds, k_preds):
         """
-        Build the 6-slot query sequence: [DUSTBIN, TEX_1, ..., TEX_K, PAD...]
-
-        Args:
-            tex_embeds: (B, 5, llm_dim) — hidden states at TEX tokens.
-            k_preds: (B,) — number of predicted textures per sample.
-
-        Returns:
-            query_embeds: (B, 6, llm_dim) — full query sequence.
-            pad_mask: (B, 6) — True for PAD slots.
+        Build the 7-slot query sequence: [DUSTBIN, SEG_1, ..., SEG_K, PAD...]
         """
-        B = tex_embeds.shape[0]
-        device = tex_embeds.device
+        B = seg_embeds.shape[0]
+        device = seg_embeds.device
 
-        # Slot 0: DUSTBIN (broadcast learned embedding)
         dustbin = self.dustbin_embed.expand(B, 1, self.llm_dim)
+        query_embeds = torch.cat([dustbin, seg_embeds], dim=1)  # (B, 7, llm_dim)
 
-        # Slots 1..5: TEX embeddings (already zero-padded for missing ones)
-        query_embeds = torch.cat([dustbin, tex_embeds], dim=1)  # (B, 6, llm_dim)
-
-        # PAD mask: channels beyond k_pred+1 (dustbin + k textures)
         pad_mask = torch.zeros(B, NUM_QUERY_SLOTS, dtype=torch.bool, device=device)
         for b in range(B):
             kp = int(k_preds[b].item())
-            # Channels kp+1 .. 5 are PAD (channel 0 is dustbin, always active)
             pad_mask[b, kp + 1:] = True
 
         return query_embeds, pad_mask
 
     # ------------------------------------------------------------------ #
-    #  SAM3 pipeline                                                       #
+    #  SAM3 pipeline (Batch Multiplexing — unchanged from V3/V4)           #
     # ------------------------------------------------------------------ #
 
     def _get_img_feats(self, backbone_out, img_ids):
-        """Extract image features from SAM3 backbone for the fusion encoder."""
         n_levels = self.sam3.num_feature_levels
         vis_feats = backbone_out["backbone_fpn"][-n_levels:]
         vis_pos_enc = backbone_out["vision_pos_enc"][-n_levels:]
@@ -347,73 +404,55 @@ class Qwen2SAMDeTexture(nn.Module):
         img_pos_embeds = [x[img_ids].flatten(2).permute(2, 0, 1) for x in vis_pos_enc]
         return img_feats, img_pos_embeds, vis_feat_sizes
 
-    def run_sam3_semantic(
-        self,
-        backbone_out: dict,
-        query_256: torch.Tensor,
-        pad_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    def run_sam3_semantic(self, backbone_out, query_256, pad_mask):
         """
-        Single batched pass through SAM3's semantic path:
-        Fusion Encoder → cross_attend_prompt → Pixel Decoder → mask head.
-
-        Args:
-            backbone_out: dict from sam3.backbone.forward_image()
-            query_256: (B, 6, 256) projected query vectors.
-            pad_mask: (B, 6) True for PAD slots.
-
-        Returns:
-            mask_logits: (B, 6, H, W) raw logits.
+        Batch Multiplexed SAM3 pass. Each query gets its own "slot 1"
+        position by flattening into the batch dimension.
         """
-        B = query_256.shape[0]
+        B, N, D = query_256.shape
         device = query_256.device
-        img_ids = torch.arange(B, device=device)
 
+        image_ids = torch.arange(B, device=device).repeat_interleave(N)
         img_feats, img_pos_embeds, vis_feat_sizes = self._get_img_feats(
-            backbone_out, img_ids
+            backbone_out, image_ids,
         )
 
-        # Prompt in seq-first format: (6, B, 256)
-        prompt = query_256.transpose(0, 1)
+        query_flat = query_256.reshape(B * N, 1, D)
+        prompt = query_flat.transpose(0, 1)
         prompt_pos = torch.zeros_like(prompt)
 
-        # Fusion Encoder: cross-attends image features with all 6 queries
         memory_dict = self.sam3.transformer.encoder(
             src=[f.clone() for f in img_feats],
             src_key_padding_mask=None,
             src_pos=[p.clone() for p in img_pos_embeds],
             prompt=prompt,
             prompt_pos=prompt_pos,
-            prompt_key_padding_mask=pad_mask,
+            prompt_key_padding_mask=None,
             feat_sizes=vis_feat_sizes,
         )
-        encoder_hidden_states = memory_dict["memory"]  # (HW, B, 256)
+        enc_hs = memory_dict["memory"]
 
-        # SegHead cross_attend_prompt: enc_hs attends to our 6 queries
         seg_head = self.sam3.segmentation_head
-        enc_hs = encoder_hidden_states
         if seg_head.cross_attend_prompt is not None:
             tgt2 = seg_head.cross_attn_norm(enc_hs)
             tgt2 = seg_head.cross_attend_prompt(
                 query=tgt2, key=prompt, value=prompt,
-                key_padding_mask=pad_mask,
+                key_padding_mask=None,
             )[0]
             enc_hs = tgt2 + enc_hs
 
-        # Pixel Decoder: enc_hs + backbone FPN → pixel_embed (B, 256, H, W)
         pixel_embed = seg_head._embed_pixels(
             backbone_feats=backbone_out["backbone_fpn"],
-            image_ids=img_ids,
+            image_ids=image_ids,
             encoder_hidden_states=enc_hs,
         )
 
-        # Multi-texture mask head: dot product → (B, 6, H, W)
-        mask_logits = self.mask_head(query_256, pixel_embed)
-
+        logits_flat = self.mask_head(query_flat, pixel_embed)
+        mask_logits = logits_flat.reshape(B, N, *logits_flat.shape[-2:])
         return mask_logits
 
     # ------------------------------------------------------------------ #
-    #  Full forward pass                                                   #
+    #  Full forward pass (V5 — live Qwen with [SEG] extraction)            #
     # ------------------------------------------------------------------ #
 
     def forward(
@@ -423,62 +462,251 @@ class Qwen2SAMDeTexture(nn.Module):
         seg_grad_to_lm: bool = True,
     ) -> dict:
         """
-        Full E2E forward pass.
+        V5 forward pass: Qwen generates with teacher forcing, hidden states
+        extracted at <|seg|> positions, projected through bottleneck, fed to SAM.
+
+        Gradients from mask loss flow: SAM → projector → [SEG] hidden states
+        → Qwen LoRA (when seg_grad_to_lm=True).
 
         Args:
-            qwen_inputs: dict from Qwen processor (input_ids, attention_mask, etc.)
+            qwen_inputs: dict from Qwen processor (input_ids, attention_mask,
+                         labels with -100 on text and real IDs on [SEG]).
             sam_images: (B, 3, 1008, 1008) SAM3-preprocessed images.
-            seg_grad_to_lm: Whether segmentation gradients flow back to Qwen LoRA.
+            seg_grad_to_lm: whether seg gradients flow to Qwen LoRA.
 
         Returns:
-            dict with:
-                mask_logits: (B, 6, H, W) raw logits.
-                tex_embeds: (B, 5, llm_dim) hidden states at TEX tokens.
-                text_align_embeds: (B, 5, clip_dim) projected for contrastive loss.
-                k_preds: (B,) predicted texture counts.
-                pad_mask: (B, 6) True for PAD channels.
-                lm_loss: scalar Qwen LM loss.
+            dict with mask_logits, seg_embeds, k_preds, pad_mask, lm_loss, query_256.
         """
-        # Step 1: Qwen forward (teacher forcing)
-        qwen_out = self.qwen(**qwen_inputs, output_hidden_states=True)
-        hidden_states = qwen_out.hidden_states[-1]  # (B, seq, llm_dim)
-        lm_loss = qwen_out.loss if qwen_out.loss is not None else torch.tensor(0.0, device=self.device)
-
-        # Step 2: Extract <TEX_i> hidden states
+        # Build block-diagonal attention mask to prevent Context Leakage.
+        # Each TEXTURE block's tokens (including <|seg|>) can only attend to
+        # the shared prefix and their own block — NOT to earlier texture blocks.
         input_ids = qwen_inputs["input_ids"]
-        tex_embeds, k_preds = self.extract_tex_hidden_states(hidden_states, input_ids)
+        attention_mask_2d = qwen_inputs.get("attention_mask")
 
-        # Step 3: Text alignment embeddings (for contrastive loss)
-        if self.text_align_head is not None:
-            text_align_embeds = self.text_align_head(tex_embeds.float())
-        else:
-            text_align_embeds = tex_embeds
+        # Step 1: Pre-compute position_ids using the standard 2D attention mask.
+        # Qwen3-VL's get_rope_index needs a 2D mask for rope position encoding.
+        # We compute this BEFORE replacing the mask with our 4D block-diagonal.
+        qwen_vl_model = self.qwen.base_model.model.model  # PeftModel → LoraModel → Qwen3VLForCausalLM → Qwen3VLModel
+        with torch.no_grad():
+            position_ids, rope_deltas = qwen_vl_model.get_rope_index(
+                input_ids,
+                qwen_inputs.get("image_grid_thw"),
+                qwen_inputs.get("video_grid_thw"),
+                attention_mask_2d,
+            )
 
-        # Step 4: Optionally detach before segmentation path
+        # Step 2: Build the 4D block-diagonal mask
+        custom_mask = self.create_independent_texture_mask(input_ids)
+
+        # Step 3: Qwen forward with pre-computed position_ids + custom 4D mask.
+        # By passing position_ids explicitly, the model skips get_rope_index
+        # (which would crash on the 4D mask).
+        qwen_fwd_inputs = {k: v for k, v in qwen_inputs.items()
+                           if k != "attention_mask"}
+        qwen_fwd_inputs["attention_mask"] = custom_mask
+        qwen_fwd_inputs["position_ids"] = position_ids
+        qwen_out = self.qwen(**qwen_fwd_inputs, output_hidden_states=True)
+        hidden_states = qwen_out.hidden_states[-1]  # (B, seq, llm_dim)
+        lm_loss = qwen_out.loss if qwen_out.loss is not None else \
+            torch.tensor(0.0, device=self.device)
+
+        # Extract hidden states at <|seg|> positions
+        seg_embeds, k_preds = self.extract_seg_hidden_states(
+            hidden_states, input_ids,
+        )
+
         if not seg_grad_to_lm:
-            tex_embeds = tex_embeds.detach()
+            seg_embeds = seg_embeds.detach()
 
-        # Step 5: Build 6 query slots [DUSTBIN, TEX_1..5]
-        query_embeds, pad_mask = self.build_query_slots(tex_embeds, k_preds)
+        # Build query slots [DUSTBIN, SEG_1..MAX]
+        query_embeds, pad_mask = self.build_query_slots(seg_embeds, k_preds)
 
-        # Step 6: MLP Projection → (B, 6, 256)
+        # Bottleneck Projection → (B, 7, 256)
         query_256 = self.projector(query_embeds)
 
-        # Step 7: SAM3 backbone (frozen)
+        # SAM3 backbone (frozen)
         with torch.no_grad():
             backbone_out = self.sam3.backbone.forward_image(sam_images)
             backbone_out["img_batch_all_stages"] = sam_images
 
-        # Step 8: SAM3 semantic path → (B, 6, H, W)
+        # SAM3 semantic path → (B, 7, H, W)
         mask_logits = self.run_sam3_semantic(backbone_out, query_256, pad_mask)
 
         return {
             "mask_logits": mask_logits,
-            "tex_embeds": tex_embeds,
-            "text_align_embeds": text_align_embeds,
+            "seg_embeds": seg_embeds,
+            "query_256": query_256,
             "k_preds": k_preds,
             "pad_mask": pad_mask,
             "lm_loss": lm_loss,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Inference forward (autoregressive generation with [SEG])             #
+    # ------------------------------------------------------------------ #
+
+    @torch.no_grad()
+    def inference_forward(
+        self,
+        qwen_inputs: dict,
+        sam_images: torch.Tensor,
+        max_new_tokens: int = 300,
+    ) -> dict:
+        """
+        V5 Inference with adaptive extraction strategy.
+
+        Pass 1 (Generation): Run qwen.generate() with STANDARD causal mask
+          and output_hidden_states=True.
+
+        Extraction (adaptive):
+          - If <|seg|> tokens found in generated text → Pass 2 with block-
+            diagonal mask for clean, decoupled extraction (mature LoRA).
+          - If NO <|seg|> tokens → regex fallback on Pass 1 hidden states
+            (early training, LoRA hasn't learned to emit <|seg|> yet).
+
+        This makes inference robust during the entire training lifecycle.
+        """
+        import re
+
+        # ---- Pass 1: Generation + hidden states -------------------------- #
+        gen_out = self.qwen.generate(
+            **qwen_inputs,
+            max_new_tokens=max_new_tokens,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            do_sample=False,
+        )
+        generated_ids = gen_out.sequences       # (B, prompt_len + gen_len)
+        prompt_len = qwen_inputs["input_ids"].shape[1]
+        B = generated_ids.shape[0]
+
+        # Collect Pass 1 hidden states (needed for regex fallback)
+        gen_hidden_list = []
+        for step_hidden in gen_out.hidden_states:
+            last_layer = step_hidden[-1]
+            if last_layer.shape[1] > 1:
+                last_layer = last_layer[:, -1:, :]
+            gen_hidden_list.append(last_layer)
+        gen_hidden = torch.cat(gen_hidden_list, dim=1)
+
+        full_hidden = torch.zeros(
+            B, generated_ids.shape[1], self.llm_dim,
+            device=generated_ids.device, dtype=gen_hidden.dtype,
+        )
+        full_hidden[:, prompt_len:prompt_len + gen_hidden.shape[1]] = gen_hidden
+
+        # Decode generated text for logging
+        generated_text = []
+        for b in range(B):
+            gen_tokens = generated_ids[b, prompt_len:]
+            text = self.processor.tokenizer.decode(
+                gen_tokens, skip_special_tokens=False,
+            )
+            generated_text.append(text)
+
+        # ---- Check if <|seg|> tokens were generated ---------------------- #
+        has_seg = (generated_ids == self.seg_token_id).any(dim=1)  # (B,)
+
+        if has_seg.all():
+            # ---- Path A: All samples have <|seg|> → Pass 2 (decoupled) --- #
+            custom_mask = self.create_independent_texture_mask(generated_ids)
+            attention_mask_2d = torch.ones(
+                B, generated_ids.shape[1],
+                dtype=torch.long, device=generated_ids.device,
+            )
+            qwen_vl_model = self.qwen.base_model.model.model
+            position_ids, _ = qwen_vl_model.get_rope_index(
+                generated_ids,
+                qwen_inputs.get("image_grid_thw"),
+                qwen_inputs.get("video_grid_thw"),
+                attention_mask_2d,
+            )
+            pass2_inputs = {
+                "input_ids": generated_ids,
+                "attention_mask": custom_mask,
+                "position_ids": position_ids,
+            }
+            for key in ("pixel_values", "image_grid_thw",
+                         "pixel_values_videos", "video_grid_thw"):
+                if key in qwen_inputs:
+                    pass2_inputs[key] = qwen_inputs[key]
+
+            pass2_out = self.qwen(**pass2_inputs, output_hidden_states=True)
+            hidden_states = pass2_out.hidden_states[-1]
+            seg_embeds, k_preds = self.extract_seg_hidden_states(
+                hidden_states, generated_ids,
+            )
+        else:
+            # ---- Path B: No <|seg|> → regex fallback on Pass 1 hidden ---- #
+            # (Early training: LoRA hasn't learned to emit <|seg|> yet)
+            seg_embeds = torch.zeros(
+                B, MAX_TEXTURES, self.llm_dim,
+                device=full_hidden.device, dtype=full_hidden.dtype,
+            )
+            k_preds = torch.zeros(B, dtype=torch.long, device=full_hidden.device)
+
+            for b in range(B):
+                # First try <|seg|> lookup for this specific sample
+                seg_pos = (generated_ids[b] == self.seg_token_id).nonzero(
+                    as_tuple=True)[0]
+                if len(seg_pos) > 0:
+                    k = min(len(seg_pos), MAX_TEXTURES)
+                    for i in range(k):
+                        seg_embeds[b, i] = full_hidden[b, seg_pos[i]]
+                    k_preds[b] = k
+                    continue
+
+                # Regex fallback: parse TEXTURE_N: lines from generated text
+                text = generated_text[b]
+                if "TEXTURE" not in text.upper():
+                    continue
+
+                was_truncated = "<|im_end|>" not in text
+                lines = text.strip().split("\n")
+                tex_count = 0
+
+                for line_idx, line in enumerate(lines):
+                    match = re.match(
+                        r"(?:<\s*)?TEXTURE[_\s]*(\d+)\s*:", line.strip(),
+                        re.IGNORECASE,
+                    )
+                    if not match or tex_count >= MAX_TEXTURES:
+                        continue
+                    if was_truncated and line_idx == len(lines) - 1:
+                        continue
+                    desc = line.strip().split(":", 1)[-1].strip()
+                    if len(desc.split()) < 3:
+                        continue
+
+                    text_up_to = "\n".join(lines[: line_idx + 1])
+                    tokens_up_to = self.processor.tokenizer.encode(
+                        text_up_to, add_special_tokens=False,
+                    )
+                    pos = prompt_len + min(
+                        len(tokens_up_to) - 1,
+                        gen_hidden.shape[1] - 1,
+                    )
+                    if 0 <= pos < full_hidden.shape[1]:
+                        seg_embeds[b, tex_count] = full_hidden[b, pos]
+                        tex_count += 1
+
+                k_preds[b] = tex_count
+
+        # ---- SAM3 pipeline ----------------------------------------------- #
+        query_embeds, pad_mask = self.build_query_slots(seg_embeds, k_preds)
+        query_256 = self.projector(query_embeds)
+
+        backbone_out = self.sam3.backbone.forward_image(sam_images)
+        backbone_out["img_batch_all_stages"] = sam_images
+        mask_logits = self.run_sam3_semantic(backbone_out, query_256, pad_mask)
+
+        return {
+            "mask_logits": mask_logits,
+            "seg_embeds": seg_embeds,
+            "k_preds": k_preds,
+            "pad_mask": pad_mask,
+            "lm_loss": torch.tensor(0.0, device=self.device),
+            "generated_text": generated_text,
         }
 
     # ------------------------------------------------------------------ #
@@ -486,20 +714,38 @@ class Qwen2SAMDeTexture(nn.Module):
     # ------------------------------------------------------------------ #
 
     def get_parameter_groups(self, base_lr: float) -> list:
-        sam3_lr_scale = self.cfg["model"].get("sam3_lr_scale", 0.1)
+        """
+        V5 parameter groups with Differential Learning Rates.
 
-        qwen_params = [p for p in self.qwen.parameters() if p.requires_grad]
+        - Qwen LoRA:  conservative LR (base * qwen_lr_scale, e.g. 2e-5)
+                       to prevent yanking pretrained weights. Frozen in
+                       Stage 1 via requires_grad=False; optimizer skips.
+        - Projector:   full base LR (e.g. 1e-4). Needs to learn fast
+                       during warmup to escape random init.
+        - Mask head + dustbin: full base LR.
+        - SAM LoRA:    scaled LR (base * sam3_lr_scale). Frozen in
+                       Stages 1-2 via requires_grad=False.
+        """
+        sam3_lr_scale = self.cfg["model"].get("sam3_lr_scale", 0.1)
+        qwen_lr_scale = self.cfg["model"].get("qwen_lr_scale", 0.2)
+
+        # Qwen LoRA params (includes frozen — optimizer skips them)
+        qwen_lora_params = [
+            p for n, p in self.qwen.named_parameters()
+            if "lora" in n.lower()
+        ]
+
         proj_params = list(self.projector.parameters())
         mask_head_params = list(self.mask_head.parameters())
         dustbin_params = [self.dustbin_embed]
 
-        # Orthogonal LoRA params (inside SAM3)
         sam3_lora_params = []
         for m in self.sam3_lora_modules:
             sam3_lora_params.extend([m.lora_A, m.lora_B])
 
         groups = [
-            {"params": qwen_params, "lr": base_lr, "name": "qwen_lora"},
+            {"params": qwen_lora_params,
+             "lr": base_lr * qwen_lr_scale, "name": "qwen_lora"},
             {"params": proj_params, "lr": base_lr, "name": "projector"},
             {"params": mask_head_params, "lr": base_lr, "name": "mask_head"},
             {"params": dustbin_params, "lr": base_lr, "name": "dustbin"},
@@ -510,16 +756,13 @@ class Qwen2SAMDeTexture(nn.Module):
                 "lr": base_lr * sam3_lr_scale,
                 "name": "sam3_orth_lora",
             })
-        if self.text_align_head is not None:
-            groups.append({
-                "params": list(self.text_align_head.parameters()),
-                "lr": base_lr,
-                "name": "text_align",
-            })
         return groups
 
     def num_trainable_params(self) -> dict:
-        qwen_n = sum(p.numel() for p in self.qwen.parameters() if p.requires_grad)
+        qwen_lora_n = sum(
+            p.numel() for n, p in self.qwen.named_parameters()
+            if p.requires_grad and "lora" in n.lower()
+        )
         proj_n = sum(p.numel() for p in self.projector.parameters())
         mask_head_n = sum(p.numel() for p in self.mask_head.parameters())
         dustbin_n = self.dustbin_embed.numel()
@@ -527,15 +770,12 @@ class Qwen2SAMDeTexture(nn.Module):
             p.numel() for m in self.sam3_lora_modules
             for p in [m.lora_A, m.lora_B]
         )
-        align_n = sum(p.numel() for p in self.text_align_head.parameters()) if self.text_align_head else 0
-
-        total = qwen_n + proj_n + mask_head_n + dustbin_n + sam3_lora_n + align_n
+        total = qwen_lora_n + proj_n + mask_head_n + dustbin_n + sam3_lora_n
         return {
-            "qwen_lora": qwen_n,
+            "qwen_lora": qwen_lora_n,
             "projector": proj_n,
             "mask_head": mask_head_n,
             "dustbin": dustbin_n,
             "sam3_orth_lora": sam3_lora_n,
-            "text_align": align_n,
-            "total": total,
+            "total_trainable": total,
         }

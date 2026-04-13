@@ -10,6 +10,8 @@ import torch
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from models.qwen2sam_detexture import MAX_TEXTURES, NUM_QUERY_SLOTS
+
 
 def compute_mask_dice(pred_logits: torch.Tensor, gt_mask: torch.Tensor,
                       n_classes: int) -> torch.Tensor:
@@ -27,10 +29,18 @@ def compute_mask_dice(pred_logits: torch.Tensor, gt_mask: torch.Tensor,
                      and GT class j+1 (skip dustbin in both).
     """
     # Softmax to get probs, skip channel 0 (dustbin)
-    probs = torch.softmax(pred_logits, dim=0)  # (6, H, W)
+    probs = torch.softmax(pred_logits, dim=0)  # (C, H_pred, W_pred)
 
-    dice = torch.zeros(5, n_classes)
-    for i in range(5):  # pred channels 1..5
+    # Upsample probs to GT resolution (preserve fine boundary detail)
+    H_gt, W_gt = gt_mask.shape[0], gt_mask.shape[1]
+    if probs.shape[1] != H_gt or probs.shape[2] != W_gt:
+        probs = torch.nn.functional.interpolate(
+            probs.unsqueeze(0), size=(H_gt, W_gt),
+            mode="bilinear", align_corners=False,
+        ).squeeze(0)
+
+    dice = torch.zeros(MAX_TEXTURES, n_classes, device=pred_logits.device)
+    for i in range(MAX_TEXTURES):  # pred channels 1..MAX_TEXTURES
         pred_soft = probs[i + 1]  # (H, W) probability for texture i+1
         for j in range(n_classes):  # GT classes 1..K_gt
             gt_bin = (gt_mask == (j + 1)).float()  # (H, W)
@@ -52,8 +62,8 @@ def compute_text_cosine(pred_embeds: torch.Tensor,
     Returns:
         sim_matrix: (K_pred, K_gt) cosine similarities in [-1, 1].
     """
-    pred_norm = torch.nn.functional.normalize(pred_embeds, dim=-1)
-    gt_norm = torch.nn.functional.normalize(gt_embeds, dim=-1)
+    pred_norm = torch.nn.functional.normalize(pred_embeds.float(), dim=-1)
+    gt_norm = torch.nn.functional.normalize(gt_embeds.float(), dim=-1)
     return pred_norm @ gt_norm.T
 
 
@@ -90,15 +100,16 @@ def hungarian_match(
         pad_mask: (6,) bool tensor — True for PAD channels.
         hallucinated_mask: (6,) bool tensor — True for unmatched preds → dustbin.
     """
-    permutation = torch.full((6,), -1, dtype=torch.long)
-    pad_mask = torch.zeros(6, dtype=torch.bool)
-    hallucinated_mask = torch.zeros(6, dtype=torch.bool)
+    device = pred_logits.device
+    permutation = torch.full((NUM_QUERY_SLOTS,), -1, dtype=torch.long, device=device)
+    pad_mask = torch.zeros(NUM_QUERY_SLOTS, dtype=torch.bool, device=device)
+    hallucinated_mask = torch.zeros(NUM_QUERY_SLOTS, dtype=torch.bool, device=device)
 
     # Channel 0 is always DUSTBIN
     permutation[0] = 0
 
     # Mark PAD channels (beyond K_pred + 1 for dustbin)
-    for i in range(k_pred + 1, 6):
+    for i in range(k_pred + 1, NUM_QUERY_SLOTS):
         pad_mask[i] = True
 
     if k_pred == 0 or k_gt == 0:
@@ -108,9 +119,8 @@ def hungarian_match(
             hallucinated_mask[i] = True
         return permutation, pad_mask, hallucinated_mask
 
-    # Build cost matrix: (K_pred, K_gt)
-    # Lower cost = better match
-    cost = torch.zeros(k_pred, k_gt)
+    # Build cost matrix: (K_pred, K_gt) on same device as inputs
+    cost = torch.zeros(k_pred, k_gt, device=pred_logits.device)
 
     # Mask-based cost (1 - Dice)
     if mask_weight > 0:
@@ -172,9 +182,10 @@ def batch_hungarian_match(
         hallucinated_masks: (B, 6) True for unmatched → dustbin.
     """
     B = pred_logits.shape[0]
-    permutations = torch.full((B, 6), -1, dtype=torch.long)
-    pad_masks = torch.zeros(B, 6, dtype=torch.bool)
-    hallucinated_masks = torch.zeros(B, 6, dtype=torch.bool)
+    device = pred_logits.device
+    permutations = torch.full((B, NUM_QUERY_SLOTS), -1, dtype=torch.long, device=device)
+    pad_masks = torch.zeros(B, NUM_QUERY_SLOTS, dtype=torch.bool, device=device)
+    hallucinated_masks = torch.zeros(B, NUM_QUERY_SLOTS, dtype=torch.bool, device=device)
 
     for b in range(B):
         pte = pred_text_embeds[b] if pred_text_embeds is not None else None
@@ -216,7 +227,7 @@ def permute_gt_mask(gt_mask: torch.Tensor, permutation: torch.Tensor,
     H, W = gt_mask.shape
     remapped = torch.zeros(H, W, dtype=torch.long, device=gt_mask.device)
 
-    for channel_idx in range(6):
+    for channel_idx in range(NUM_QUERY_SLOTS):
         gt_class = permutation[channel_idx].item()
         if gt_class < 0:
             continue  # PAD — skip

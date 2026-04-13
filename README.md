@@ -1,8 +1,8 @@
-# Qwen2SAM-DeTexture
+# Qwen2SAM-DeTexture (V5)
 
-**End-to-End VLM-Guided Multi-Texture Segmentation**
+**End-to-End VLM-Guided Multi-Texture Segmentation with [SEG] Token Grounding**
 
-An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a Geometric Segmentation Engine (**SAM 3**) to segment images into 1-5 distinct texture regions. The model learns to isolate raw materials and textures (e.g., "rough mossy rock", "smooth flowing water") while explicitly absorbing non-texture pixels (objects, background) into a dedicated **Dustbin** channel.
+An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a Geometric Segmentation Engine (**SAM 3**) to segment images into 1-6 distinct texture regions. The model uses a dedicated **[SEG] token** to decouple visual grounding from language context, a **block-diagonal attention mask** to prevent cross-texture contamination, and a **bottleneck projector** (~2M params) that forces domain-agnostic generalization.
 
 ---
 
@@ -11,18 +11,21 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
 - [Key Innovations](#key-innovations)
 - [Architecture Overview](#architecture-overview)
 - [Detailed Architecture](#detailed-architecture)
-  - [Module A: Qwen3-VL (The Prompt Generator)](#module-a-qwen3-vl-the-prompt-generator)
-  - [Module B: MLP Projector (The Bridge)](#module-b-mlp-projector-the-bridge)
-  - [Module C: SAM 3 (The Geometry Engine)](#module-c-sam-3-the-geometry-engine)
+  - [Module A: Qwen3-VL with [SEG] Token](#module-a-qwen3-vl-with-seg-token)
+  - [Module B: Bottleneck Projector](#module-b-bottleneck-projector)
+  - [Module C: SAM 3 with Batch Multiplexing](#module-c-sam-3-with-batch-multiplexing)
   - [Module D: Multi-Texture Mask Head](#module-d-multi-texture-mask-head)
 - [The Dustbin Query](#the-dustbin-query)
+- [Block-Diagonal Attention Mask](#block-diagonal-attention-mask)
+- [Loss Masking (Anti-Count-Collapse)](#loss-masking-anti-count-collapse)
 - [Orthogonal LoRA](#orthogonal-lora)
 - [Training Process](#training-process)
+  - [Three-Stage Curriculum](#three-stage-curriculum)
   - [Forward Pass Walkthrough](#forward-pass-walkthrough)
-  - [Hungarian Matching](#hungarian-matching)
   - [Loss Functions](#loss-functions)
-  - [Gradient Strategy](#gradient-strategy)
-- [Inference](#inference)
+  - [Differential Learning Rates](#differential-learning-rates)
+- [Inference (Two-Pass Strategy)](#inference-two-pass-strategy)
+- [Ablation History (V1-V5)](#ablation-history-v1-v5)
 - [Project Structure](#project-structure)
 - [Configuration](#configuration)
 - [Getting Started](#getting-started)
@@ -33,13 +36,15 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
 
 | Innovation | What it solves |
 |---|---|
-| **Variable-K texture segmentation (1-5)** | Prior work was limited to exactly 2 textures (A/B). This model handles any number dynamically. |
+| **[SEG] Token Grounding** | Dedicated `<\|seg\|>` token after each texture description. Qwen's LoRA learns to pack visually-grounded spatial information into this token, decoupling it from noisy language context. |
+| **Block-Diagonal Attention Mask** | Prevents Context Leakage: TEXTURE_2's `<\|seg\|>` hidden state cannot attend to TEXTURE_1's tokens. Proven to reduce inter-texture cosine similarity from 0.74 to 0.16. |
+| **Loss Masking (-100 on text)** | LM loss is computed ONLY on `<\|seg\|>` token positions. Prevents V3's "Count Collapse" where Qwen learned to terminate after one texture to minimize text-prediction loss. |
+| **Information Bottleneck (2M params)** | Projector reduced from 10.5M to 2.1M params. V4 proved that larger projectors memorize domain-specific manifold directions (Directional Drift). The bottleneck forces generalization. |
+| **Batch Multiplexing** | Each query is fed to SAM independently in its own "slot 1" position. Eliminates SAM3's pretrained positional bias where only the first query slot received attention. |
 | **Dustbin Query** | A learned embedding that absorbs non-texture pixels (objects, sky, etc.), preventing false texture assignments. |
-| **Orthogonal LoRA** | Fine-tunes SAM3's cross-attention without catastrophic forgetting of zero-shot capabilities. The LoRA weight updates are regularized to be orthogonal to SAM3's pretrained weight subspace. |
-| **Single-token extraction from causal LM** | Instead of mean-pooling multi-token descriptions (which dilutes information), we extract the single hidden state at each `<TEX_i>` marker token. Causal LMs naturally concentrate all context into the final token. |
-| **Batched 6-query SAM3 pass** | All 6 query vectors (DUSTBIN + up to 5 textures) are processed in a single forward pass through SAM3's Fusion Encoder, not in a loop. Full GPU parallelization. |
-| **Smooth 3-layer MLP projector** | Prevents information loss during the 8x dimensionality reduction (2048 -> 256) with intermediate LayerNorm and GELU activations. |
-| **Dynamic prompt (train-test consistency)** | During training, the model sees `N = "1 to 5"` instead of the GT count, forcing it to learn to count textures autonomously. |
+| **Orthogonal LoRA** | Fine-tunes SAM3's cross-attention without catastrophic forgetting. LoRA updates are regularized to be orthogonal to SAM3's pretrained weight subspace. |
+| **Three-Stage Curriculum** | Cold Start Protection: (1) Projector warmup, (2) Qwen LoRA at conservative LR, (3) SAM LoRA end-to-end. Prevents garbage gradients from a random projector corrupting Qwen's pretrained weights. |
+| **Two-Pass Inference** | Pass 1: standard causal generation (no repetition). Pass 2: block-diagonal masked forward (decoupled [SEG] extraction). Train-test parity guaranteed. |
 
 ---
 
@@ -55,338 +60,288 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
                   v                                   v
     +----------------------------+     +----------------------------+
     |  MODULE A: Qwen3-VL-8B     |     |  SAM3 Backbone (frozen)    |
-    |  (frozen + LoRA on q,v)    |     |  Image Encoder             |
+    |  (LoRA r=8 on q,v)         |     |  Image Encoder             |
     |                            |     |  1008x1008 -> FPN features |
     |  Input: image + prompt     |     +-------------+--------------+
     |  Output: text descriptions |                   |
-    |  with <TEX_i> markers      |                   |
+    |  with <|seg|> markers      |                   |
     +-------------+--------------+                   |
                   |                                  |
                   v                                  |
     +----------------------------+                   |
-    |  Extract <TEX_i> hidden    |                   |
-    |  states (single token each)|                   |
+    |  Block-Diagonal Mask       |                   |
+    |  Extract <|seg|> hidden    |                   |
+    |  states (decoupled)        |                   |
     |                            |                   |
-    |  K vectors of dim 2048     |                   |
+    |  K vectors of dim 4096     |                   |
     +-------------+--------------+                   |
                   |                                  |
                   v                                  |
     +----------------------------+                   |
-    |  Build 6 Query Slots       |                   |
+    |  Build 7 Query Slots       |                   |
     |                            |                   |
-    |  [DUSTBIN, TEX_1, ...,     |                   |
-    |   TEX_K, PAD, ..., PAD]    |                   |
+    |  [DUSTBIN, SEG_1, ...,     |                   |
+    |   SEG_K, PAD, ..., PAD]    |                   |
     |                            |                   |
-    |  6 vectors of dim 2048     |                   |
+    |  7 vectors of dim 4096     |                   |
     +-------------+--------------+                   |
                   |                                  |
                   v                                  |
     +----------------------------+                   |
-    |  MODULE B: MLP Projector   |                   |
-    |  (trainable from scratch)  |                   |
+    |  MODULE B: Bottleneck      |                   |
+    |  Projector (~2M params)    |                   |
     |                            |                   |
-    |  2048 -> 1024 + LN + GELU  |                   |
-    |  1024 -> 512 + GELU        |                   |
+    |  4096 -> 512 + LN + GELU  |                    |
+    |    + Dropout(0.15)         |                   |
     |  512  -> 256               |                   |
-    |                            |                   |
-    |  6 vectors of dim 256      |                   |
     +-------------+--------------+                   |
                   |                                  |
                   +----------------------------------+
                   |                                  |
                   v                                  v
     +-------------------------------------------------------+
-    |  MODULE C: SAM3 Semantic Path (SINGLE BATCHED PASS)    |
+    |  MODULE C: SAM3 — Batch Multiplexed                    |
+    |  (B, 7, 256) -> flatten -> (B*7, 1, 256)               |
+    |  Each query gets its own "slot 1" position             |
     |                                                        |
     |  Fusion Encoder (frozen + Orthogonal LoRA)             |
-    |    - Cross-attends image features with 6 queries       |
-    |    - All 6 queries processed simultaneously            |
-    |                        |                               |
-    |                        v                               |
     |  SegHead cross_attend_prompt (frozen + Orth. LoRA)     |
-    |    - Encoder hidden states attend to 6 queries         |
-    |                        |                               |
-    |                        v                               |
-    |  Pixel Decoder (frozen)                                |
-    |    - encoder_hs + backbone FPN -> pixel_embed          |
-    |    - Output: (B, 256, H, W)                            |
+    |  Pixel Decoder (frozen) -> pixel_embed                 |
     +----------------------------+---------------------------+
                                  |
                                  v
     +-------------------------------------------------------+
-    |  MODULE D: Multi-Texture Mask Head (trainable)         |
-    |                                                        |
-    |  query_proj = MLP(queries)        -> (B, 6, 256)       |
-    |  pixel_proj = Conv1x1(pixel_embed) -> (B, 256, H, W)   |
-    |                                                        |
-    |  mask_logits = einsum("bqc, bchw -> bqhw")             |
-    |                                                        |
-    |  Output: (B, 6, H, W) raw logits                       |
-    |    Channel 0: DUSTBIN (background/objects)             |
-    |    Channels 1-K: Texture regions                       |
-    |    Channels K+1 to 5: PAD (masked to -inf)             |
+    |  MODULE D: Multi-Texture Mask Head (trainable)        |
+    |                                                       |
+    |  einsum(queries, pixel_embed) -> (B, 7, H, W)         |
+    |                                                       |
+    |  Channel 0: DUSTBIN     Channels 1-K: Textures        |
+    |  Channels K+1 to 6: PAD (masked to -inf)              |
     +-------------------------------------------------------+
-                                 |
-                                 v
-                    +------------------------+
-                    |  Softmax(dim=1) -> WTA  |
-                    |  Pixel-wise assignment  |
-                    +------------------------+
 ```
 
 ---
 
 ## Detailed Architecture
 
-### Module A: Qwen3-VL (The Prompt Generator)
+### Module A: Qwen3-VL with [SEG] Token
 
 **Model**: `Qwen/Qwen3-VL-8B-Instruct`
-**Status**: Frozen base weights + LoRA (rank=16) on `q_proj` and `v_proj` attention layers.
-
-**Role**: Analyzes the input image and generates rich texture descriptions. The model is prompted with:
-
-```
-System: "You are an expert at analyzing surface textures in images.
-         Always respond in the exact format requested, with no extra text."
-
-User: [image] "This image contains exactly 1 to 5 main visually distinct
-       regions separated by boundaries..."
-```
+**Status**: Frozen base weights + LoRA (r=8) on `q_proj` and `v_proj`.
+**Training**: LoRA receives gradients ONLY through `<|seg|>` token positions (loss masking).
 
 **Output format** (teacher-forced during training):
 ```
-TEXTURE_1: Texture of rough mossy stone with granular surface in the foreground <TEX_1>
-TEXTURE_2: Texture of smooth flowing water with reflective sheen in the center <TEX_2>
-TEXTURE_3: Texture of dry sandy ground with ripple patterns on the right <TEX_3>
+TEXTURE_1: Texture of rough mossy stone with granular surface in the foreground <|seg|>
+TEXTURE_2: Texture of smooth flowing water with reflective sheen in the center <|seg|>
+TEXTURE_3: Texture of dry sandy ground with ripple patterns on the right <|seg|>
 ```
 
-**Key design**: Each description ends with a special `<TEX_i>` token. We extract the **single hidden state** at that token position (not mean-pooling). In causal language models, the final token of a sequence naturally accumulates all preceding context, making it the richest representation.
-
-**5 special tokens** added to Qwen's vocabulary: `<TEX_1>` through `<TEX_5>`.
+The `<|seg|>` token is a dedicated grounding anchor. Unlike natural language end-of-line tokens (which absorb context from ALL prior tokens via causal attention), `<|seg|>` hidden states are computed under a **block-diagonal attention mask** that isolates each texture block from previous blocks. This produces clean, decoupled visual representations.
 
 ---
 
-### Module B: MLP Projector (The Bridge)
+### Module B: Bottleneck Projector
 
-**Status**: Fully trainable from scratch.
+**Status**: Fully trainable (~2.1M params).
 
-Reduces the 2048-dimensional Qwen hidden states to SAM3's 256-dimensional query space. A naive single-layer projection would destroy semantic information. Instead, we use a **3-layer smooth bottleneck**:
+Maps `<|seg|>` hidden states from Qwen's 4096-D space to SAM3's 256-D query space through a deliberately constrained bottleneck:
 
 ```
-Layer 1: Linear(2048 -> 1024) + LayerNorm(1024) + GELU
-Layer 2: Linear(1024 -> 512)  + GELU
-Layer 3: Linear(512  -> 256)
+Linear(4096 -> 512) + LayerNorm(512) + GELU + Dropout(0.15)
+Linear(512  -> 256)
 ```
 
-The `LayerNorm` after the first layer stabilizes the distribution shift between the LLM and segmentation domains.
+**Why so small?** V4 ablation studies proved that a larger projector (10.5M params) memorizes ADE20K-specific manifold directions that don't generalize to unseen domains (Directional Drift). The V4-Slim bridge experiment confirmed: reducing to 2.6M params eliminated the drift entirely and produced the first trained model to beat the zero-shot baseline (mIoU 0.7316 vs 0.7063).
 
 ---
 
-### Module C: SAM 3 (The Geometry Engine)
+### Module C: SAM 3 with Batch Multiplexing
 
-**Components used** (from the SAM3 architecture):
+Each of the 7 query vectors is fed to SAM **independently** by flattening the query dimension into the batch dimension:
+
+```
+(B, 7, 256) -> reshape -> (B*7, 1, 256) -> SAM -> (B*7, 1, H, W) -> reshape -> (B, 7, H, W)
+```
+
+This eliminates SAM3's pretrained positional bias (V2 ablation: Slot 1 received 90.5% of pixels, Slot 2 received 0.0%). Image features are indexed via `image_ids` (no memory copy).
 
 | Component | Status | Role |
 |---|---|---|
-| Image Encoder (ViT backbone) | **Frozen** | Extracts multi-scale visual features (FPN) |
-| Fusion Encoder | **Frozen + Orthogonal LoRA** | Cross-attends image features with our 6 text queries |
-| `seg_head.cross_attend_prompt` | **Frozen + Orthogonal LoRA** | Enriches encoder hidden states with query semantics |
-| Pixel Decoder | **Frozen** | Produces dense pixel embeddings (B, 256, H, W) |
-
-**Components NOT used**: DETR Decoder (200 object queries), Detector, Tracker, Masklet Matcher, Semantic Seg Head (`Conv2d(256,1)` -- only 1 channel, insufficient for 6 outputs).
-
-**Why not the Semantic Seg Head?** The frozen `Conv2d(256, 1)` can only output a single channel. With 6 queries fused into the pixel embeddings simultaneously, we need 6 output channels. The Multi-Texture Mask Head (Module D) solves this via dot-product between queries and pixel features.
-
-**Single batched pass**: All 6 queries are concatenated into a single prompt tensor `(B, 6, 256)` and processed through the Fusion Encoder in one forward pass. No Python for-loops over queries.
+| Image Encoder (ViT) | **Frozen** | Multi-scale visual features (FPN) |
+| Fusion Encoder | **Frozen + Orthogonal LoRA** | Cross-attends image features with queries |
+| `cross_attend_prompt` | **Frozen + Orthogonal LoRA** | Enriches encoder hidden states |
+| Pixel Decoder | **Frozen** | Dense pixel embeddings (B, 256, H, W) |
 
 ---
 
 ### Module D: Multi-Texture Mask Head
 
-**Status**: Fully trainable from scratch.
-
-This is the dot-product mask prediction head, inspired by SAM3's `MaskPredictor`:
+**Status**: Fully trainable.
 
 ```python
-query_proj  = MLP(queries)          # (B, 6, 256) -> (B, 6, 256)
+query_proj  = MLP(queries)          # (B, 7, 256) -> (B, 7, 256)
 pixel_proj  = Conv1x1(pixel_embed)  # (B, 256, H, W) -> (B, 256, H, W)
-mask_logits = einsum("bqc, bchw -> bqhw", query_proj, pixel_proj)  # (B, 6, H, W)
+mask_logits = einsum("bqc, bchw -> bqhw", query_proj, pixel_proj)  # (B, 7, H, W)
 ```
-
-Each of the 6 queries "votes" for pixels that belong to its texture. The `einsum` computes this dot-product in parallel across all queries and all pixels.
 
 ---
 
 ## The Dustbin Query
 
-The **DUSTBIN** is a learned embedding (2048-dim, trainable) that occupies **channel 0** of the output. It absorbs all non-texture pixels: objects, sky, background, or anything that doesn't belong to a distinct texture region.
+Channel 0 is a learned 4096-dim embedding that absorbs all non-texture pixels.
 
-**Why channel 0?** The ground-truth index mask uses value `0` for background/non-texture pixels. By placing DUSTBIN at channel 0, the `CrossEntropyLoss` target indices align directly with the output channels -- no remapping needed.
-
-**Query slot layout** (always 6 slots):
 ```
-Index:  [  0     ,   1   ,   2   , ...,  K  , K+1 , ...,  5  ]
-Role:   [DUSTBIN , TEX_1 , TEX_2 , ..., TEX_K, PAD , ..., PAD ]
+Index:  [  0     ,  1   ,  2   , ...,  K  , K+1 , ...,  6  ]
+Role:   [DUSTBIN , SEG_1, SEG_2, ..., SEG_K, PAD , ..., PAD ]
 ```
 
-PAD slots have their logits set to `-inf` before softmax/CE, ensuring they never receive probability mass.
+PAD slots have logits set to `-inf` before softmax/CE.
+
+---
+
+## Block-Diagonal Attention Mask
+
+During both training and inference extraction, a custom 4D attention mask prevents Context Leakage between texture blocks:
+
+```
+         prefix  TEX_1  TEX_2  TEX_3
+prefix  [causal  ────   ────   ─── ]
+TEX_1   [  ok   causal ────   ──── ]
+TEX_2   [  ok    BLOCK causal ──── ]   <- TEX_2 CANNOT see TEX_1
+TEX_3   [  ok    BLOCK  BLOCK causal]   <- TEX_3 CANNOT see TEX_1 or TEX_2
+```
+
+All blocks can attend to the shared prefix (system + image + user prompt). Within each block, standard causal attention applies.
+
+**Why this matters**: Without the mask, Qwen's causal attention causes `<|seg|>_2` to absorb semantic noise from TEXTURE_1's description. Ablation proved this inflates inter-texture cosine similarity from 0.16 (with mask) to 0.74 (without mask), causing Directional Drift in the projector.
+
+---
+
+## Loss Masking (Anti-Count-Collapse)
+
+```python
+labels = torch.full_like(input_ids, -100)  # mask everything
+labels[input_ids == seg_token_id] = seg_token_id  # unmask only <|seg|>
+```
+
+This prevents the V3 failure mode where Qwen's LoRA learned to terminate after TEXTURE_1 (minimizing text-prediction loss at the expense of finding multiple textures). With loss masking, the LoRA ONLY receives LM gradient at `<|seg|>` positions. The primary training signal flows through mask loss: `Mask Loss -> SAM -> Projector -> [SEG] hidden states -> Qwen LoRA`.
 
 ---
 
 ## Orthogonal LoRA
 
-Standard LoRA fine-tuning risks overwriting SAM3's powerful pretrained features (catastrophic forgetting). **Orthogonal LoRA** constrains the weight updates to directions that don't interfere with the original capabilities.
-
-**How it works:**
-
-1. For each frozen weight matrix `W_0`, compute its top-k singular vectors via SVD:
-   ```
-   U_k, S_k, V_k = SVD(W_0)  -->  U_k: (out, k) dominant directions
-   ```
-
-2. The LoRA update is `DeltaW = B @ A` (low-rank). We penalize its projection onto `W_0`'s dominant subspace:
-   ```
-   L_orth = || U_k^T @ DeltaW ||_F^2
-   ```
-
-3. This penalty is added to the total loss, pushing `DeltaW` into the **null space** of `W_0`'s dominant singular vectors -- the "free directions" that don't disturb pretrained behavior.
-
-**Applied to**: Cross-attention layers in the Fusion Encoder and `seg_head.cross_attend_prompt`, specifically the Q and V projection weights.
+Applied to SAM3's cross-attention layers. Constrains weight updates to directions orthogonal to SAM3's pretrained dominant singular vectors:
 
 ```
-Fusion Encoder Layer 0: cross_attn_image.q_proj (OrthLoRA), cross_attn_image.v_proj (OrthLoRA)
-Fusion Encoder Layer 1: cross_attn_image.q_proj (OrthLoRA), cross_attn_image.v_proj (OrthLoRA)
-...
-SegHead cross_attend_prompt: q_proj (OrthLoRA), v_proj (OrthLoRA)
+L_orth = || U_k^T @ (B @ A) ||_F^2
 ```
+
+This preserves SAM3's zero-shot segmentation capability while adapting to texture-specific features.
 
 ---
 
 ## Training Process
 
+### Three-Stage Curriculum (Cold Start Protection)
+
+| Stage | Epochs | Trainable | Frozen | Purpose |
+|---|---|---|---|---|
+| **1. Projector Warmup** | 1-2 | Projector + mask head + dustbin | Qwen LoRA, SAM LoRA | Projector escapes random init |
+| **2. Joint Co-Adaptation** | 3-5 | + Qwen LoRA (conservative LR) | SAM LoRA | LoRA gently refines [SEG] representations |
+| **3. End-to-End** | 6+ | + SAM LoRA | — | Full joint convergence |
+
 ### Forward Pass Walkthrough
 
-Here is the exact flow for a single training image with **K_gt = 3** ground-truth textures, where Qwen predicts **K_pred = 4** (one hallucination):
-
 ```
-Step 1: Qwen Forward (teacher forcing)
-  |  Image + prompt "This image contains 1 to 5 regions..."
-  |  -> hidden_states (B, seq_len, 2048) + lm_loss
+Step 1: Qwen Forward (teacher forcing with <|seg|> tokens)
+  |  Image + prompt + "TEXTURE_1: desc <|seg|>\nTEXTURE_2: desc <|seg|>"
+  |  Block-diagonal attention mask applied
+  |  -> hidden_states + lm_loss (only on <|seg|> positions)
   |
-Step 2: Extract <TEX_i> Hidden States
-  |  Find <TEX_1>, <TEX_2>, <TEX_3>, <TEX_4> in token sequence
-  |  Extract 4 hidden state vectors (each 2048-dim)
-  |  K_pred = 4
+Step 2: Extract <|seg|> Hidden States
+  |  Clean token lookup (no regex, no position arithmetic)
+  |  K vectors of dim 4096, each decoupled from other texture blocks
   |
-Step 3: Build 6 Query Slots
-  |  Slot 0: DUSTBIN (learned embedding)
-  |  Slot 1: TEX_1 hidden state
-  |  Slot 2: TEX_2 hidden state
-  |  Slot 3: TEX_3 hidden state
-  |  Slot 4: TEX_4 hidden state  (the hallucination)
-  |  Slot 5: PAD (zeros)
-  |  -> (B, 6, 2048)
+Step 3: Build 7 Query Slots
+  |  [DUSTBIN, SEG_1, ..., SEG_K, PAD, ..., PAD]
   |
-Step 4: MLP Projection
-  |  (B, 6, 2048) -> (B, 6, 256)
+Step 4: Bottleneck Projection
+  |  (B, 7, 4096) -> (B, 7, 256)
   |
-Step 5: SAM3 Backbone (frozen, computed once)
-  |  Image -> FPN features
+Step 5: SAM3 Batch Multiplexed
+  |  (B, 7, 256) -> (B*7, 1, 256) -> Fusion Encoder -> Pixel Decoder
+  |  -> (B, 7, H, W) mask logits
   |
-Step 6: SAM3 Semantic Path (single batched pass)
-  |  Fusion Encoder: image features x 6 queries
-  |  -> cross_attend_prompt -> Pixel Decoder
-  |  -> pixel_embed (B, 256, H, W)
-  |
-Step 7: Mask Head
-  |  einsum(6 queries, pixel_embed) -> (B, 6, H, W) logits
-  |
-Step 8: Hungarian Matching (no_grad)
-  |  4 predictions vs 3 GT textures
-  |  Cost matrix: text cosine similarity + mask Dice overlap
-  |  Result: 3 matched pairs + 1 hallucination -> DUSTBIN
-  |
-Step 9: Loss Computation
-  |  CE + Dice on masks (PAD channel masked to -inf)
-  |  Contrastive on text (matched=attract, hallucinated=repel)
-  |  MSE on count (4 vs 3)
-  |  LM loss on Qwen text generation
-  |  Orthogonal penalty on SAM3 LoRA
+Step 6: Loss
+  |  Mask: CE + heavy Dice (weight 3.0) on pixel predictions
+  |  LM: CE on <|seg|> tokens only (all text masked to -100)
+  |  Orth: regularization on SAM LoRA
 ```
-
-### Hungarian Matching
-
-For each sample in the batch, we solve a bipartite assignment problem:
-
-1. **Build cost matrix** `C[i,j]` of shape `(K_pred, K_gt)`:
-   - Text cost: `(1 - cosine_similarity) / 2` between predicted and GT CLIP embeddings
-   - Mask cost: `1 - Dice` between predicted soft masks and GT binary masks
-   - `C[i,j] = text_weight * text_cost + mask_weight * mask_cost`
-
-2. **Solve** with `scipy.optimize.linear_sum_assignment(C)` (polynomial-time optimal assignment).
-
-3. **Handle mismatches**:
-   - **Matched predictions**: Permuted to align with GT channel indices
-   - **Unmatched predictions** (hallucinations): Target becomes DUSTBIN (channel 0)
-   - **PAD slots**: Excluded from all loss computations
-
-4. **Remap GT mask**: The ground-truth index mask is permuted so that `GT_pixel == channel_idx` for the Cross-Entropy loss.
 
 ### Loss Functions
 
 ```
-L_total = lambda_mask * (L_CE + L_Dice)
-        + lambda_text * L_contrastive
-        + lambda_count * L_count
-        + lambda_lm * L_lm
-        + lambda_orth * L_orthogonal
+L_total = mask_weight * (CE + 3.0 * Dice) + lm_weight * LM_seg + orth_weight * L_orth
 ```
 
-| Loss | Formula | Weight | Notes |
-|---|---|---|---|
-| **Cross-Entropy** | `CE(raw_logits, GT_index_mask)` | 1.0 | Applied to RAW logits (PyTorch applies LogSoftmax internally). PAD channels = -inf. |
-| **Dice** | `1 - (2*inter + s) / (union + s)` per channel | 1.0 | Applied to `softmax(logits, dim=1)` probabilities. PAD excluded. |
-| **Text Contrastive** | `CosineEmbeddingLoss` | 0.5 | Matched pairs: target=+1 (attract). Hallucinated: target=-1 (repel). |
-| **Count Penalty** | `MSE(K_pred, K_gt)` | 0.1 | Gentle regularization. Too high causes mode collapse (model refuses to predict textures). |
-| **LM Loss** | Qwen autoregressive CE | 0.5 | Trains Qwen to generate accurate descriptions. |
-| **Orthogonal Reg** | `\|\| U_k^T @ DeltaW \|\|_F^2` | 0.01 | Prevents catastrophic forgetting of SAM3 zero-shot capabilities. |
+| Loss | Weight | Notes |
+|---|---|---|
+| **Cross-Entropy** | 1.0 | Pixel-wise, PAD channels = -inf |
+| **Dice** | 3.0 | Per-channel, PAD excluded |
+| **LM (seg-only)** | 0.1 | Only `<\|seg\|>` tokens — prevents count collapse |
+| **Orthogonal Reg** | 0.01 | SAM LoRA stays in null space of pretrained weights |
 
-### Gradient Strategy
+### Differential Learning Rates
 
-**Segmentation gradient warmup**: For the first N epochs (default: 10), the texture embeddings are **detached** before entering the SAM3 path. This allows Qwen's LoRA to stabilize on the LM loss and text alignment before the noisy segmentation gradients flow back.
-
-```
-Epoch  1-10:  Qwen learns to describe textures (LM + contrastive only)
-Epoch 11+:    Full E2E gradients (LM + contrastive + segmentation -> Qwen LoRA)
-```
-
-**Differential learning rates**:
-| Component | Learning Rate |
-|---|---|
-| Qwen LoRA | `base_lr` (1e-4) |
-| MLP Projector | `base_lr` (1e-4) |
-| Mask Head | `base_lr` (1e-4) |
-| DUSTBIN embedding | `base_lr` (1e-4) |
-| SAM3 Orthogonal LoRA | `base_lr * 0.1` (1e-5) |
+| Component | LR | Notes |
+|---|---|---|
+| Projector | 1e-4 (base) | Needs to learn fast during warmup |
+| Mask Head + Dustbin | 1e-4 (base) | |
+| Qwen LoRA | 2e-5 (0.2x base) | Conservative — protects pretrained weights |
+| SAM3 Orth LoRA | 1e-5 (0.1x base) | Frozen in Stages 1-2 |
 
 ---
 
-## Inference
+## Inference (Two-Pass Strategy)
 
-At inference time, the model runs without teacher forcing:
+```
+Pass 1 — Generation (standard causal mask):
+  Qwen generates the full texture description sequence naturally.
+  Standard causal attention ensures no repetition.
 
-```python
-# 1. Prompt Qwen with "1 to 5" (or specific N if known)
-# 2. Qwen generates descriptions freely (no teacher forcing)
-# 3. Extract <TEX_i> tokens from generated text
-# 4. Build query slots -> MLP -> SAM3 -> mask_logits (B, 6, H, W)
-# 5. Set PAD channels to -inf
-# 6. argmax(dim=1) -> pixel-wise texture assignment
+Pass 2 — Extraction (block-diagonal mask):
+  The FULL generated sequence is re-run through Qwen with the
+  block-diagonal custom mask. Each <|seg|> hidden state is computed
+  in isolation from other texture blocks — matching training conditions.
+
+  If <|seg|> tokens are not yet emitted (early training), a regex
+  fallback extracts from TEXTURE_N: line-end positions in Pass 1.
 ```
 
-The output is a spatial map where each pixel is assigned to either:
-- **0**: Background / non-texture (DUSTBIN)
-- **1-K**: One of K detected texture regions
+This two-pass approach guarantees train-test parity while preserving generation quality.
+
+---
+
+## Ablation History (V1-V5)
+
+| Version | Key Change | Best RWTD mIoU | Failure Mode |
+|---|---|---:|---|
+| V1 | Direct 1-to-1, Qwen bypass P1 | 0.678 | Qwen LoRA overfitting |
+| V2 | + Crop aug + cycle loss + constrained LoRA | 0.695 | SAM Slot 1 Addiction |
+| V3 | + Batch Multiplexing | 0.703 | Phase 2 LLM co-training collapse |
+| V4 | Frozen Qwen Oracle + Architectural Plug | 0.692 | Directional Drift (10.5M projector) |
+| V4-Slim | + Information Bottleneck (2.6M) | **0.732** | First to beat ZS baseline (0.706) |
+| **V5** | + [SEG] token + block-diagonal mask + loss masking | **TBD** | In progress |
+
+Key discoveries:
+- **V2**: SAM3 has extreme positional bias (Slot 1 gets 90.5%, Slot 2 gets 0.0%)
+- **V3**: LLM co-training is fundamentally toxic — causes count collapse + projector drift + SAM regression
+- **V4**: Directional Drift — the projector learns ADE20K-specific directions that don't generalize. Representation Collapse disproved (vectors get MORE separated, not less)
+- **V4-Slim**: Information Bottleneck prevents Directional Drift. 4x param reduction forces generalization
+- **V5**: Context Leakage from "1 to 6" prompt inflates inter-texture cosine from 0.16 to 0.74. Block-diagonal mask eliminates this
+
+Full ablation data: `ablation/v1/` through `ablation/v4/`
 
 ---
 
@@ -396,53 +351,70 @@ The output is a spatial map where each pixel is assigned to either:
 Qwen2SAM_DeTexture/
 |
 +-- configs/
-|   +-- detexture.yaml           # All hyperparameters
+|   +-- detexture.yaml              # V5 config (main)
+|   +-- detexture_v4_slim.yaml      # V4-Slim bridge experiment
 |
 +-- models/
-|   +-- qwen2sam_detexture.py    # Main E2E model class
-|   +-- projector.py             # 3-layer smooth bottleneck MLP
-|   +-- orthogonal_lora.py       # Orthogonal LoRA wrapper
-|   +-- hungarian.py             # N-way Hungarian matching
-|   +-- losses.py                # All loss functions
+|   +-- qwen2sam_detexture.py       # V5 main model (SEG token, block mask, two-pass)
+|   +-- qwen2sam_v4_slim.py         # V4-Slim bridge model
+|   +-- projector.py                # V5 bottleneck projector (4096->512->256)
+|   +-- orthogonal_lora.py          # Orthogonal LoRA wrapper
+|   +-- losses.py                   # V5 losses (mask + LM_seg + orth)
 |
 +-- data/
-|   +-- dataset.py               # DeTextureDataset + DeTextureCollator
+|   +-- dataset.py                  # DeTextureDataset + V5 collator (<|seg|> + loss masking)
 |
 +-- training/
-|   +-- train.py                 # Training loop
-|   +-- utils.py                 # Config, seed, scheduler, checkpointing
+|   +-- train.py                    # V5 training loop (3-stage curriculum)
+|   +-- train_v4_slim.py            # V4-Slim training loop
+|   +-- monitor.py                  # Sanity checker, logger, plotter, test evaluator
+|   +-- utils.py                    # Config, seed, scheduler, checkpointing
 |
 +-- scripts/
-|   +-- evaluate.py              # Evaluation script
-|   +-- prepare_data.py          # Data preparation
+|   +-- analyze_vector_collapse.py  # Pre/post projector cosine similarity analysis
+|   +-- analyze_visual_bias.py      # Orthogonal subspace projection (INSID3-inspired)
+|   +-- ablation_live_ade20k.py     # Control group: live inference on in-domain data
+|   +-- ablation_k2_only.py         # Prompt count ablation (1-to-6 vs exactly-2)
+|   +-- generate_gt_embeds_v4.py    # GT embedding regeneration (V4 train/test alignment)
+|   +-- inspect_sam3_text_encoder.py # SAM3 text encoder architecture probe
+|
++-- ablation/
+|   +-- v1/ v2/ v3/ v4/             # Per-version ablation studies + analyses
+|   +-- vector_collapse_analysis.json
+|   +-- visual_bias_analysis.json
+|   +-- live_ade20k_control.json
 ```
 
 ---
 
 ## Configuration
 
-All hyperparameters are in `configs/detexture.yaml`:
-
 ```yaml
 model:
   qwen_model: "Qwen/Qwen3-VL-8B-Instruct"
-  lora_r: 16                    # Qwen LoRA rank
-  sam3_lora_r: 8                # SAM3 Orthogonal LoRA rank
-  sam3_lora_n_singular: 32      # SVD vectors for orthogonality
+  lora_r: 8                       # Qwen LoRA rank
+  lora_alpha: 16
+  qwen_lr_scale: 0.2              # Qwen LR = base * 0.2 = 2e-5
+  projector_hidden_dim: 512       # Bottleneck dimension
+  sam3_lora_r: 32                 # SAM3 Orthogonal LoRA rank
+  sam3_lr_scale: 0.1
 
-training:
-  batch_size: 1
-  gradient_accumulation_steps: 8  # Effective batch = 8
-  num_epochs: 100
-  learning_rate: 1.0e-4
-  seg_grad_warmup_epochs: 10    # Detach seg grads for first 10 epochs
+curriculum:
+  projector_warmup_epochs: 2      # Stage 1: only projector
+  e2e_epoch: 5                    # Stage 3: SAM LoRA unfreezes
 
 loss:
   mask_weight: 1.0
-  text_contrastive_weight: 0.5
-  count_weight: 0.1
-  lm_weight: 0.5
+  ce_weight: 1.0
+  dice_weight: 3.0
+  lm_weight: 0.1                  # Only on <|seg|> tokens
   orthogonal_weight: 0.01
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4  # Effective batch = 8
+  num_epochs: 60
+  learning_rate: 1.0e-4
 ```
 
 ---
@@ -464,9 +436,12 @@ cd /home/aviad/Qwen2SAM_DeTexture
 python -m training.train --config configs/detexture.yaml
 ```
 
-### Data Format
+Resume from checkpoint:
+```bash
+python -m training.train --config configs/detexture.yaml --resume auto
+```
 
-The dataset expects a JSON metadata file:
+### Data Format
 
 ```json
 [
@@ -480,35 +455,27 @@ The dataset expects a JSON metadata file:
 ]
 ```
 
-Each mask is a binary PNG where white pixels belong to that texture. The dustbin (background) is implicitly defined as pixels not covered by any texture mask.
-
 ---
 
-## Freezing Strategy Summary
+## Trainable Parameters
 
 ```
 +-----------------------------------------------------------+
 |                    TRAINABLE COMPONENTS                   |
 +-----------------------------------------------------------+
-| Qwen3-VL LoRA (q_proj, v_proj)          ~4M params        |
-| MLP Projector (2048->1024->512->256)     ~1.6M params     |
+| Qwen3-VL LoRA (r=8, q_proj + v_proj)    ~3.8M params      |
+| Bottleneck Projector (4096->512->256)    ~2.1M params     |
 | Multi-Texture Mask Head                  ~0.2M params     |
-| DUSTBIN embedding                        2048 params      |
-| SAM3 Orthogonal LoRA (cross-attn Q,V)   ~0.1M params      |
-| Text alignment head                      ~1M params       |
+| DUSTBIN embedding (4096-dim)             4,096 params     |
+| SAM3 Orthogonal LoRA (cross-attn)       ~0.3M params      |
 +-----------------------------------------------------------+
-| TOTAL TRAINABLE                          ~7M params       |
+| TOTAL TRAINABLE                          ~6.6M params     |
 +-----------------------------------------------------------+
 
 +-----------------------------------------------------------+
 |                      FROZEN COMPONENTS                    |
 +-----------------------------------------------------------+
 | Qwen3-VL base weights                   ~8B params        |
-| SAM3 Image Encoder (ViT backbone)       ~300M params      |
-| SAM3 Fusion Encoder (base weights)      ~9.5M params      |
-| SAM3 Pixel Decoder                      ~2M params        |
-| CLIP text encoder (for GT embeddings)   ~63M params       |
+| SAM3 Image Encoder + Fusion + Decoder    ~300M params     |
 +-----------------------------------------------------------+
 ```
-
-Only **~7M parameters** are trained. The vast majority of the model (~8.4B) remains frozen.

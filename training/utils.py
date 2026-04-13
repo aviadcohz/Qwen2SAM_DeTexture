@@ -112,14 +112,14 @@ def save_checkpoint(model, optimizer, epoch, path, extra=None):
     if hasattr(model, "dustbin_embed"):
         state["dustbin_embed"] = model.dustbin_embed.data
 
-    # Save LoRA modules from SAM3
+    # Save LoRA modules from SAM3 (both wrapped linears and parametrized MHA weights)
     lora_state = {}
     for name, module in model.named_modules():
-        from models.orthogonal_lora import OrthogonalLoRALinear
-        if isinstance(module, OrthogonalLoRALinear):
+        from models.orthogonal_lora import OrthogonalLoRALinear, OrthogonalLoRAParametrization
+        if isinstance(module, (OrthogonalLoRALinear, OrthogonalLoRAParametrization)):
             lora_state[name] = {
-                "lora_A": module.lora_A.data,
-                "lora_B": module.lora_B.data,
+                "lora_A": module.lora_A.data.cpu(),
+                "lora_B": module.lora_B.data.cpu(),
             }
     state["sam3_lora"] = lora_state
 

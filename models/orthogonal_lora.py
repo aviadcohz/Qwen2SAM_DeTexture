@@ -1,7 +1,7 @@
 """
 Orthogonal LoRA for nn.MultiheadAttention and nn.Linear layers.
 
-Applies low-rank adaptation ΔW = A·B while regularizing ΔW to be
+Applies low-rank adaptation ΔW = B·A while regularizing ΔW to be
 orthogonal to the original frozen weights W₀. This prevents catastrophic
 forgetting of SAM3's zero-shot capabilities.
 
@@ -9,12 +9,22 @@ The orthogonality penalty projects ΔW onto the dominant singular vectors
 of W₀ and penalizes the projection magnitude:
     L_orth = || U_k^T · ΔW ||_F^2
 where U_k are the top-k left singular vectors of W₀.
+
+For nn.MultiheadAttention with packed in_proj_weight, we use
+torch.nn.utils.parametrize.register_parametrization to inject LoRA
+into the separate q/k/v projection weights while preserving PyTorch's
+native attention path (FlashAttention / SDPA).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils.parametrize as parametrize
 
+
+# ===================================================================== #
+#  OrthogonalLoRALinear — for wrapping standalone nn.Linear layers       #
+# ===================================================================== #
 
 class OrthogonalLoRALinear(nn.Module):
     """
@@ -22,9 +32,6 @@ class OrthogonalLoRALinear(nn.Module):
 
     Wraps a frozen linear layer and adds a trainable low-rank bypass:
         output = frozen_linear(x) + (x @ A^T) @ B^T   [scaled by alpha/r]
-
-    The orthogonality penalty ensures ΔW = B^T @ A^T is orthogonal to W₀'s
-    dominant singular subspace.
     """
 
     def __init__(
@@ -34,13 +41,6 @@ class OrthogonalLoRALinear(nn.Module):
         alpha: float = 16.0,
         n_singular: int = 32,
     ):
-        """
-        Args:
-            frozen_linear: The original frozen nn.Linear layer.
-            r: LoRA rank.
-            alpha: LoRA scaling factor.
-            n_singular: Number of top singular vectors of W₀ to project against.
-        """
         super().__init__()
         self.frozen_linear = frozen_linear
         self.r = r
@@ -54,12 +54,11 @@ class OrthogonalLoRALinear(nn.Module):
         self.lora_A = nn.Parameter(torch.randn(r, in_features) * 0.01)
         self.lora_B = nn.Parameter(torch.zeros(out_features, r))
 
-        # Precompute top-k left singular vectors of W₀ (frozen, not a parameter)
+        # Precompute top-k left singular vectors of W₀
         with torch.no_grad():
-            W0 = frozen_linear.weight.data.float()  # (out, in)
+            W0 = frozen_linear.weight.data.float()
             k = min(n_singular, min(W0.shape))
             U, S, Vt = torch.linalg.svd(W0, full_matrices=False)
-            # U_k: (out, k) — dominant left singular vectors
             self.register_buffer("U_k", U[:, :k].clone())
 
         # Freeze the original linear
@@ -67,24 +66,67 @@ class OrthogonalLoRALinear(nn.Module):
             p.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Frozen path
         base_out = self.frozen_linear(x)
-        # LoRA path: x @ A^T @ B^T * scaling
         lora_out = F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
         return base_out + lora_out
 
     def orthogonal_penalty(self) -> torch.Tensor:
-        """
-        Compute orthogonality penalty: || U_k^T @ ΔW ||_F^2
-
-        ΔW = B @ A (out_features, in_features) scaled.
-        Project ΔW onto U_k's column space and penalize.
-        """
-        delta_W = (self.lora_B @ self.lora_A) * self.scaling  # (out, in)
-        # Project onto dominant subspace: U_k^T @ ΔW → (k, in)
+        """|| U_k^T @ ΔW ||_F^2 where ΔW = B @ A * scaling."""
+        delta_W = (self.lora_B @ self.lora_A) * self.scaling
         proj = self.U_k.T @ delta_W
         return (proj ** 2).sum()
 
+
+# ===================================================================== #
+#  OrthogonalLoRAParametrization — for MHA projection weights            #
+# ===================================================================== #
+
+class OrthogonalLoRAParametrization(nn.Module):
+    """
+    Parametrization module for register_parametrization().
+
+    Dynamically computes W_effective = W_frozen + (B @ A) * scaling
+    on every forward pass. Autograd flows through the matmul to
+    lora_A and lora_B, so they train correctly.
+    """
+
+    def __init__(self, in_features: int, out_features: int,
+                 r: int = 8, alpha: float = 16.0, n_singular: int = 32,
+                 frozen_weight: torch.Tensor = None):
+        super().__init__()
+        self.scaling = alpha / r
+
+        # LoRA matrices
+        self.lora_A = nn.Parameter(torch.randn(r, in_features) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+
+        # Top-k SVD of frozen weight for orthogonal penalty
+        if frozen_weight is not None:
+            with torch.no_grad():
+                W0 = frozen_weight.float()
+                k = min(n_singular, min(W0.shape))
+                U, S, Vt = torch.linalg.svd(W0, full_matrices=False)
+                self.register_buffer("U_k", U[:, :k].clone())
+        else:
+            self.register_buffer("U_k", torch.empty(0))
+
+    def forward(self, W_frozen: torch.Tensor) -> torch.Tensor:
+        """Called by parametrize: returns W_frozen + LoRA delta."""
+        delta = (self.lora_B @ self.lora_A) * self.scaling
+        return W_frozen + delta.to(W_frozen.dtype)
+
+    def orthogonal_penalty(self) -> torch.Tensor:
+        """|| U_k^T @ ΔW ||_F^2"""
+        if self.U_k.numel() == 0:
+            return torch.tensor(0.0, device=self.lora_A.device)
+        delta_W = (self.lora_B @ self.lora_A) * self.scaling
+        proj = self.U_k.T @ delta_W
+        return (proj ** 2).sum()
+
+
+# ===================================================================== #
+#  apply_orthogonal_lora_to_mha — main entry point                      #
+# ===================================================================== #
 
 def apply_orthogonal_lora_to_mha(
     mha: nn.MultiheadAttention,
@@ -96,103 +138,72 @@ def apply_orthogonal_lora_to_mha(
     """
     Apply Orthogonal LoRA to selected projections of an nn.MultiheadAttention.
 
-    nn.MultiheadAttention stores Q/K/V as a single packed `in_proj_weight`
-    of shape (3 * embed_dim, embed_dim). We split it into 3 frozen linears
-    and wrap the targeted ones with LoRA.
+    For packed in_proj_weight: splits into separate q/k/v_proj_weight
+    Parameters and uses register_parametrization for LoRA targets.
+    PyTorch's native MHA forward (FlashAttention/SDPA) is preserved.
 
-    Args:
-        mha: The nn.MultiheadAttention module to wrap.
-        r: LoRA rank.
-        alpha: LoRA scaling factor.
-        n_singular: Number of singular vectors for orthogonal constraint.
-        target_projections: Which projections to apply LoRA to ("q", "k", "v").
+    For already-separate projections: wraps with OrthogonalLoRALinear.
 
-    Returns:
-        Dict mapping projection name to OrthogonalLoRALinear (for penalty collection).
+    Returns dict of modules that have orthogonal_penalty() for loss collection.
     """
     embed_dim = mha.embed_dim
     lora_modules = {}
 
-    # Check if using packed in_proj or separate q/k/v projections
     if mha.in_proj_weight is not None:
-        # Packed: split into Q, K, V linears
-        W = mha.in_proj_weight.data  # (3*embed_dim, embed_dim)
-        b = mha.in_proj_bias.data if mha.in_proj_bias is not None else None
+        # --- Packed in_proj_weight: split into separate q/k/v ---
+        W = mha.in_proj_weight.data.clone()
+        has_bias = mha.in_proj_bias is not None
+        b = mha.in_proj_bias.data.clone() if has_bias else None
 
-        splits = {"q": 0, "k": 1, "v": 2}
-        frozen_linears = {}
-        for name, idx in splits.items():
-            start = idx * embed_dim
-            end = (idx + 1) * embed_dim
-            linear = nn.Linear(embed_dim, embed_dim, bias=(b is not None))
-            linear.weight.data.copy_(W[start:end])
-            if b is not None:
-                linear.bias.data.copy_(b[start:end])
-            frozen_linears[name] = linear
+        # Split weights
+        W_q = W[:embed_dim]
+        W_k = W[embed_dim:2 * embed_dim]
+        W_v = W[2 * embed_dim:]
 
-        # Replace the packed projection with split linears
-        # We store them and override forward behavior
-        for name in ("q", "k", "v"):
-            if name in target_projections:
-                lora_mod = OrthogonalLoRALinear(
-                    frozen_linears[name], r=r, alpha=alpha, n_singular=n_singular,
-                )
-                lora_modules[name] = lora_mod
-            else:
-                # Keep frozen linear (no LoRA)
-                for p in frozen_linears[name].parameters():
-                    p.requires_grad = False
-                lora_modules[name] = frozen_linears[name]
-
-        # Disable the original packed projection
+        # Switch MHA to separate-projection mode
         mha.in_proj_weight = None
         mha.in_proj_bias = None
         mha._qkv_same_embed_dim = False
 
-        # Store split modules on the MHA so they're part of the model
-        mha.q_proj_lora = lora_modules["q"]
-        mha.k_proj_lora = lora_modules["k"]
-        mha.v_proj_lora = lora_modules["v"]
+        # Register separate projection weight Parameters (frozen base)
+        mha.q_proj_weight = nn.Parameter(W_q, requires_grad=False)
+        mha.k_proj_weight = nn.Parameter(W_k, requires_grad=False)
+        mha.v_proj_weight = nn.Parameter(W_v, requires_grad=False)
 
-        # Monkey-patch the forward to use our split projections
-        original_out_proj = mha.out_proj
-
-        def patched_forward(
-            query, key, value,
-            key_padding_mask=None, need_weights=False,
-            attn_mask=None, **kwargs,
-        ):
-            q = mha.q_proj_lora(query)
-            k = mha.k_proj_lora(key)
-            v = mha.v_proj_lora(value)
-
-            # Use PyTorch's multi_head_attention_forward internals
-            attn_output, attn_weights = F.multi_head_attention_forward(
-                query=q, key=k, value=v,
-                embed_dim_to_check=embed_dim,
-                num_heads=mha.num_heads,
-                in_proj_weight=None,
-                in_proj_bias=None,
-                bias_k=mha.bias_k, bias_v=mha.bias_v,
-                add_zero_attn=mha.add_zero_attn,
-                dropout_p=mha.dropout if mha.training else 0.0,
-                out_proj_weight=original_out_proj.weight,
-                out_proj_bias=original_out_proj.bias,
-                training=mha.training,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                attn_mask=attn_mask,
-                use_separate_proj_weight=True,
-                q_proj_weight=None,  # not used when q is pre-projected
-                k_proj_weight=None,
-                v_proj_weight=None,
+        # Register separate bias Parameters
+        if has_bias:
+            b_q = b[:embed_dim]
+            b_k = b[embed_dim:2 * embed_dim]
+            b_v = b[2 * embed_dim:]
+            # MHA forward looks for in_proj_bias when _qkv_same_embed_dim=False
+            # and uses bias_k/bias_v. But with separate weights, it expects
+            # individual bias handling. Set in_proj_bias to None and handle via
+            # the forward's internal logic which concatenates q/k/v biases.
+            # PyTorch MHA with separate weights uses in_proj_bias=None but
+            # internally slices if present. We register as a concatenated bias.
+            mha.register_parameter(
+                "in_proj_bias",
+                nn.Parameter(torch.cat([b_q, b_k, b_v]), requires_grad=False),
             )
-            return attn_output, attn_weights
 
-        mha.forward = patched_forward
+        # Apply parametrization to target projections
+        for name in ("q", "k", "v"):
+            weight_attr = f"{name}_proj_weight"
+            W_proj = getattr(mha, weight_attr).data
+
+            if name in target_projections:
+                param_module = OrthogonalLoRAParametrization(
+                    in_features=embed_dim, out_features=embed_dim,
+                    r=r, alpha=alpha, n_singular=n_singular,
+                    frozen_weight=W_proj,
+                )
+                parametrize.register_parametrization(mha, weight_attr, param_module)
+                lora_modules[name] = param_module
+
+        # DO NOT override mha.forward — native attention (FlashAttention) is used
 
     else:
-        # Already using separate q_proj, k_proj, v_proj
+        # --- Already using separate q_proj, k_proj, v_proj modules ---
         proj_map = {"q": "q_proj", "k": "k_proj", "v": "v_proj"}
         for name in target_projections:
             attr = proj_map[name]
@@ -203,21 +214,4 @@ def apply_orthogonal_lora_to_mha(
             setattr(mha, attr, lora_mod)
             lora_modules[name] = lora_mod
 
-    # Return only the LoRA-wrapped modules (for penalty collection)
-    return {k: v for k, v in lora_modules.items()
-            if isinstance(v, OrthogonalLoRALinear)}
-
-
-def collect_orthogonal_penalties(lora_modules: list) -> torch.Tensor:
-    """
-    Sum orthogonal penalties from all OrthogonalLoRALinear modules.
-
-    Args:
-        lora_modules: List of OrthogonalLoRALinear instances.
-    Returns:
-        Scalar penalty tensor.
-    """
-    penalty = torch.tensor(0.0, device=lora_modules[0].lora_A.device)
-    for mod in lora_modules:
-        penalty = penalty + mod.orthogonal_penalty()
-    return penalty
+    return lora_modules

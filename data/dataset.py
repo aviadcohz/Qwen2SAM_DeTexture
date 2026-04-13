@@ -11,6 +11,7 @@ with N="1 to 5" during training to prevent train-test mismatch.
 """
 
 import json
+import random
 import cv2
 import numpy as np
 import torch
@@ -66,21 +67,25 @@ USER_PROMPT_TEMPLATE = (
     "TEXTURE_{N}: Texture of <description>"
 )
 
-# Training: use "1 to 5" to force model to dynamically decide count
-TRAIN_USER_PROMPT = USER_PROMPT_TEMPLATE.format(N="1 to 5")
+# Training: use "1 to 6" to force model to dynamically decide count
+TRAIN_USER_PROMPT = USER_PROMPT_TEMPLATE.format(N="1 to 6")
 
 
 def build_assistant_text(descriptions: list[str]) -> str:
     """
-    Build assistant response with <TEX_i> tokens at the END of each description.
+    V5: Build assistant response with <|seg|> token after each description.
+
+    The <|seg|> token is a dedicated grounding anchor — Qwen's LoRA learns
+    to pack visual-spatial information into its hidden state.
 
     Example output:
-        "TEXTURE_1: Texture of rough mossy stone in the foreground <TEX_1>
-         TEXTURE_2: Texture of smooth water in the center <TEX_2>"
+        "TEXTURE_1: Texture of rough mossy stone in the foreground <|seg|>
+         TEXTURE_2: Texture of smooth water in the center <|seg|>"
     """
+    from models.qwen2sam_detexture import SEG_TOKEN
     lines = []
     for i, desc in enumerate(descriptions):
-        lines.append(f"TEXTURE_{i+1}: {desc} <TEX_{i+1}>")
+        lines.append(f"TEXTURE_{i+1}: {desc} {SEG_TOKEN}")
     return "\n".join(lines)
 
 
@@ -91,39 +96,29 @@ def build_assistant_text(descriptions: list[str]) -> str:
 def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
                   tokenizer) -> torch.Tensor:
     """
-    Create LM labels: -100 for system/user/padding tokens, actual IDs for
-    assistant tokens only.
+    V5 Loss Masking: -100 for ALL tokens EXCEPT <|seg|>.
 
-    Finds the assistant turn by locating the assistant header token sequence
-    in the tokenized chat.
+    This prevents the LoRA from receiving text-prediction gradients (which
+    caused V3's "Count Collapse" where Qwen learned to terminate early).
+    The LoRA ONLY receives gradient at [SEG] positions, through:
+      1. Trivial LM loss: predict <|seg|> given preceding context
+      2. Segmentation loss: flows back through projector → [SEG] hidden state → LoRA
+
+    The text generation capability stays frozen (base Qwen weights).
     """
-    labels = input_ids.clone()
-    B, L = labels.shape
+    from models.qwen2sam_detexture import SEG_TOKEN
 
-    # Find the last occurrence of the assistant turn marker
-    # In Qwen's chat template, the assistant section starts after
-    # the "assistant\n" tokens.
-    assistant_marker = tokenizer.encode("assistant\n", add_special_tokens=False)
-    marker_len = len(assistant_marker)
+    seg_token_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
 
-    for b in range(B):
-        ids = input_ids[b].tolist()
-        # Find last occurrence of assistant marker
-        assistant_start = -1
-        for i in range(len(ids) - marker_len, -1, -1):
-            if ids[i:i + marker_len] == assistant_marker:
-                assistant_start = i + marker_len
-                break
+    # Start with everything masked
+    labels = torch.full_like(input_ids, -100)
 
-        if assistant_start >= 0:
-            # Mask everything before assistant response
-            labels[b, :assistant_start] = -100
-        else:
-            # If not found, mask everything (safety)
-            labels[b, :] = -100
+    # Only unmask <|seg|> token positions
+    seg_mask = (input_ids == seg_token_id)
+    labels[seg_mask] = input_ids[seg_mask]
 
-        # Mask padding
-        labels[b, attention_mask[b] == 0] = -100
+    # Also mask padding (redundant but explicit)
+    labels[attention_mask == 0] = -100
 
     return labels
 
@@ -158,11 +153,65 @@ class DeTextureDataset(Dataset):
         metadata_path: str,
         image_size: int = SAM3_SIZE,
         augment: bool = False,
+        qwen_gt_embeds_path: str = None,
     ):
         with open(metadata_path) as f:
             self.samples = json.load(f)
         self.image_size = image_size
         self.augment = augment
+
+        # Load pre-computed Qwen GT embeddings for self-distillation
+        self.gt_embeds = None
+        if qwen_gt_embeds_path and Path(qwen_gt_embeds_path).exists():
+            self.gt_embeds = torch.load(qwen_gt_embeds_path, map_location="cpu")
+            print(f"Loaded {len(self.gt_embeds)} Qwen GT embeddings from {qwen_gt_embeds_path}")
+
+    def _apply_crop(self, image_np, index_mask, descriptions, qwen_gt, k_gt):
+        """
+        Random crop augmentation to simulate RWTD-style close-up textures.
+        Crops image + mask, filters surviving textures, remaps indices contiguously.
+        Returns originals unchanged if fewer than 2 textures survive the crop.
+        """
+        H, W = image_np.shape[:2]
+        crop_size = random.randint(300, 600)
+        crop_size = min(crop_size, H, W)
+
+        y1 = random.randint(0, H - crop_size)
+        x1 = random.randint(0, W - crop_size)
+        y2, x2 = y1 + crop_size, x1 + crop_size
+
+        # Crop image and mask
+        cropped_img = image_np[y1:y2, x1:x2].copy()
+        cropped_mask = index_mask[y1:y2, x1:x2].copy()
+
+        # Find surviving texture indices (non-zero, non-dustbin)
+        surviving_ids = sorted(set(int(v) for v in np.unique(cropped_mask) if v > 0))
+
+        # Need at least 2 textures for meaningful boundary signal
+        if len(surviving_ids) < 2:
+            return image_np, index_mask, descriptions, qwen_gt, k_gt
+
+        # Remap surviving indices to contiguous 1..N
+        new_mask = np.zeros_like(cropped_mask)
+        new_descriptions = []
+        from models.qwen2sam_detexture import MAX_TEXTURES
+        new_qwen_gt = torch.zeros(MAX_TEXTURES, 4096)
+
+        for new_idx, old_idx in enumerate(surviving_ids):
+            new_mask[cropped_mask == old_idx] = new_idx + 1  # 1-indexed
+            new_descriptions.append(descriptions[old_idx - 1])  # old_idx is 1-based
+            new_qwen_gt[new_idx] = qwen_gt[old_idx - 1]
+
+        new_k_gt = len(surviving_ids)
+
+        # Resize crop back to image_size
+        cropped_img = cv2.resize(cropped_img, (self.image_size, self.image_size),
+                                  interpolation=cv2.INTER_LINEAR)
+        new_mask_full = cv2.resize(new_mask.astype(np.uint8),
+                                    (self.image_size, self.image_size),
+                                    interpolation=cv2.INTER_NEAREST).astype(np.int64)
+
+        return cropped_img, new_mask_full, new_descriptions, new_qwen_gt, new_k_gt
 
     def __len__(self):
         return len(self.samples)
@@ -176,8 +225,9 @@ class DeTextureDataset(Dataset):
         image_np = cv2.resize(image_np, (self.image_size, self.image_size),
                               interpolation=cv2.INTER_LINEAR)
 
-        # Load per-texture masks and build index mask
-        textures = meta["textures"]
+        # Load per-texture masks and build index mask (cap at MAX_TEXTURES)
+        from models.qwen2sam_detexture import MAX_TEXTURES
+        textures = meta["textures"][:MAX_TEXTURES]
         k_gt = len(textures)
         descriptions = []
         index_mask = np.zeros((self.image_size, self.image_size), dtype=np.int64)
@@ -190,6 +240,22 @@ class DeTextureDataset(Dataset):
                                   interpolation=cv2.INTER_NEAREST)
                 # Assign texture index (1-based, 0 is dustbin)
                 index_mask[mask > 127] = i + 1
+
+        # Load pre-computed Qwen GT embeddings if available
+        from models.qwen2sam_detexture import MAX_TEXTURES
+        qwen_gt = torch.zeros(MAX_TEXTURES, 4096)
+        if self.gt_embeds is not None:
+            key = meta["image_path"]
+            if key in self.gt_embeds:
+                gt = self.gt_embeds[key].float()  # (K, 4096)
+                qwen_gt[:gt.shape[0]] = gt
+
+        # Dynamic Macro-to-Micro crop augmentation (30-40% probability)
+        # Simulates RWTD-style crops to prevent scene-level overfitting
+        if self.augment and random.random() < 0.35:
+            image_np, index_mask, descriptions, qwen_gt, k_gt = self._apply_crop(
+                image_np, index_mask, descriptions, qwen_gt, k_gt,
+            )
 
         # Build assistant text with <TEX_i> tokens
         assistant_text = build_assistant_text(descriptions)
@@ -207,6 +273,7 @@ class DeTextureDataset(Dataset):
             "index_mask": torch.from_numpy(index_mask),
             "k_gt": k_gt,
             "descriptions": descriptions,
+            "qwen_gt_embeds": qwen_gt,
         }
 
 
@@ -219,18 +286,17 @@ class DeTextureCollator:
     Collate function for Qwen2SAM-DeTexture DataLoader.
 
     Builds Qwen chat messages, tokenizes, creates LM labels,
-    and stacks SAM3 inputs + GT masks.
+    and stacks SAM3 inputs + GT masks. CPU-only — no GPU operations.
+    CLIP encoding is handled separately in the training loop.
     """
 
     def __init__(
         self,
         processor,
-        clip_model=None,
         inference: bool = False,
     ):
         self.processor = processor
         self.tokenizer = processor.tokenizer
-        self.clip_model = clip_model
         self.inference = inference
 
     def __call__(self, samples: list) -> dict:
@@ -239,7 +305,6 @@ class DeTextureCollator:
 
         for s in samples:
             if self.inference:
-                # During inference, let model generate freely
                 assistant_text = ""
             else:
                 assistant_text = s["assistant_text"]
@@ -265,7 +330,7 @@ class DeTextureCollator:
             )
             images.append(s["image"])
 
-        # Tokenize
+        # Tokenize (CPU only)
         qwen_inputs = self.processor(
             text=texts, images=images, return_tensors="pt", padding=True,
         )
@@ -285,36 +350,17 @@ class DeTextureCollator:
         index_masks = torch.stack([s["index_mask"] for s in samples])
         k_gts = torch.tensor([s["k_gt"] for s in samples], dtype=torch.long)
 
-        # Pre-compute CLIP GT text embeddings if clip model provided
-        gt_text_embeds = None
-        if self.clip_model is not None and not self.inference:
-            gt_text_embeds = self._encode_gt_texts(samples)
+        # Stack Qwen GT embeddings for self-distillation
+        qwen_gt_embeds = torch.stack([s["qwen_gt_embeds"] for s in samples])
+
+        # V4: per-sample GT description lists for SAM text encoder distillation
+        descriptions = [s["descriptions"] for s in samples]
 
         return {
             "qwen_inputs": qwen_inputs,
             "sam_images": sam_images,
             "index_masks": index_masks,
             "k_gts": k_gts,
-            "gt_text_embeds": gt_text_embeds,
+            "qwen_gt_embeds": qwen_gt_embeds,  # (B, MAX_TEXTURES, 4096)
+            "descriptions": descriptions,       # List[List[str]] for SAM text distillation
         }
-
-    @torch.no_grad()
-    def _encode_gt_texts(self, samples: list) -> torch.Tensor:
-        """Encode GT descriptions via frozen CLIP text encoder."""
-        B = len(samples)
-        embeds = torch.zeros(B, 5, self.clip_model.config.projection_dim)
-
-        for b, s in enumerate(samples):
-            descs = s["descriptions"]
-            if not descs:
-                continue
-            import transformers
-            tokenizer = transformers.CLIPTokenizer.from_pretrained(
-                self.clip_model.config.name_or_path
-            )
-            inputs = tokenizer(descs, return_tensors="pt", padding=True, truncation=True)
-            inputs = {k: v.to(self.clip_model.device) for k, v in inputs.items()}
-            text_features = self.clip_model.get_text_features(**inputs)
-            embeds[b, :len(descs)] = text_features.cpu()
-
-        return embeds
