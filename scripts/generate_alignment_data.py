@@ -401,6 +401,9 @@ MIN_WORDS = 8       # post-template minimum word count
 MAX_WORDS = 30      # reject rambling entries (also as a safety valve)
 
 
+_TEXTURE_N_RE = re.compile(r"texture_\d+", re.IGNORECASE)
+
+
 def passes_sanity(text: str) -> bool:
     """Return True iff the description is logically and grammatically plausible."""
     # Minimum length
@@ -415,7 +418,7 @@ def passes_sanity(text: str) -> bool:
             return False
 
     # Must contain the expected skeleton tokens
-    if "texture_1" not in text.lower() or "<|seg|>" not in text:
+    if not _TEXTURE_N_RE.search(text) or "<|seg|>" not in text:
         return False
     if ": texture of" not in text.lower():
         return False
@@ -432,11 +435,16 @@ def passes_sanity(text: str) -> bool:
 #  Generators                                                             #
 # ===================================================================== #
 
-TEMPLATE = "TEXTURE_1: Texture of {name}, {features}, {context} <|seg|>"
+TEMPLATE = "TEXTURE_{n}: Texture of {name}, {features}, {context} <|seg|>"
+
+# During real V7 training a sample has 1..6 textures, so Qwen sees TEXTURE_N
+# prefixes where N is any of 1..6 (most samples are k=1-3 in RWTD). We
+# enumerate all six to make the Bridge prefix-invariant.
+TEXTURE_INDICES = [1, 2, 3, 4, 5, 6]
 
 
-def format_description(name: str, features: str, context: str) -> str:
-    return TEMPLATE.format(name=name, features=features, context=context)
+def format_description(name: str, features: str, context: str, n: int) -> str:
+    return TEMPLATE.format(n=n, name=name, features=features, context=context)
 
 
 def extract_ade20k_descriptions(metadata_path: Path) -> list[str]:
@@ -457,39 +465,41 @@ def extract_ade20k_descriptions(metadata_path: Path) -> list[str]:
             if not desc:
                 continue
             # ADE20K descriptions are already like "Texture of X, Y, Z".
-            # Wrap with TEXTURE_1: prefix + <|seg|> suffix.
+            # Wrap with TEXTURE_N: prefix (N varies 1..6 to match V7 training
+            # distribution) + <|seg|> suffix.
             if desc.lower().startswith("texture of"):
                 core = desc[len("texture of"):].lstrip(", ").strip()
-                # Split into pieces; if the description has the (name, features,
-                # context) structure we preserve it; otherwise we wrap in a
-                # default context.
-                out.add(f"TEXTURE_1: Texture of {core} <|seg|>")
+                body = f"Texture of {core}"
             else:
-                out.add(f"TEXTURE_1: Texture of {desc} <|seg|>")
-    log.info(f"Loaded {len(out)} unique ADE20K descriptions.")
+                body = f"Texture of {desc}"
+            for n in TEXTURE_INDICES:
+                out.add(f"TEXTURE_{n}: {body} <|seg|>")
+    log.info(f"Loaded {len(out)} unique ADE20K descriptions (across TEXTURE_N).")
     return list(out)
 
 
 def generate_synthetic_for_category(cat: dict, target_count: int,
                                     rng: random.Random) -> list[str]:
-    """Exhaustively enumerate the valid combinatorial space for one category,
-    apply sanity filter, deduplicate, shuffle, and return up to
-    `target_count` descriptions. No cross-category contamination.
+    """Exhaustively enumerate the valid combinatorial space for one category
+    (including TEXTURE_N prefix variation over N ∈ {1..6} to prevent the
+    Bridge from learning an index bias), apply sanity filter, deduplicate,
+    shuffle, and return up to `target_count` descriptions. No cross-category
+    contamination.
 
-    For each (noun, color, pattern, feature, spatial) tuple we emit TWO
+    For each (noun, color, pattern, feature, spatial, N) tuple we emit TWO
     grammatical framings:
         "<color> <pattern>"            (pattern-led)
         "<color> with <feature>"       (feature-led)
     Max unique per category = |nouns| × |colors| × |patterns| × |features|
-                              × |spatials| × 2.
+                              × |spatials| × |N-values| × 2.
     """
     combos = []
-    for name, color, pattern, feat, spatial in itertools.product(
+    for name, color, pattern, feat, spatial, n in itertools.product(
         cat["nouns"], cat["colors"], cat["patterns"], cat["features"],
-        SPATIAL_CONTEXTS,
+        SPATIAL_CONTEXTS, TEXTURE_INDICES,
     ):
-        combos.append(format_description(name, f"{color} {pattern}", spatial))
-        combos.append(format_description(name, f"{color} with {feat}", spatial))
+        combos.append(format_description(name, f"{color} {pattern}", spatial, n))
+        combos.append(format_description(name, f"{color} with {feat}", spatial, n))
 
     sane = [c for c in combos if passes_sanity(c)]
     unique = list(set(sane))
