@@ -142,18 +142,23 @@ CATEGORIES = {
     "insects": {
         "nouns": [
             "butterfly wings", "beetle shell", "ladybug shell",
-            "dragonfly wings", "spider web", "ant body",
+            "dragonfly wings", "spider web", "ant body", "moth wings",
+            "bee body", "wasp body", "grasshopper shell", "cricket body",
+            "cicada wings", "mantis body",
         ],
         "features": [
             "delicate wings", "hard exoskeleton", "translucent membrane",
-            "fine bristles",
+            "fine bristles", "glossy shell", "powdery dust",
+            "segmented body", "chitinous plates",
         ],
         "colors": [
             "black", "red", "yellow", "iridescent", "metallic green",
-            "orange-and-black",
+            "orange-and-black", "deep blue", "pearly white",
+            "bronze-colored", "purplish",
         ],
         "patterns": [
             "spotted pattern", "veined pattern", "symmetrical pattern",
+            "banded pattern", "eyespot pattern", "speckled pattern",
         ],
     },
     "vegetation": {
@@ -179,12 +184,14 @@ CATEGORIES = {
         "nouns": [
             "sand", "soil", "dirt", "gravel", "mud", "snow", "ice",
             "pebbles", "dry earth", "forest floor", "beach sand",
-            "mountain soil",
+            "mountain soil", "desert sand", "volcanic ash", "clay",
+            "packed earth", "riverbed mud", "frozen ground",
         ],
         "features": [
             "granular texture", "fine grains", "coarse grains",
-            "rough surface", "wet surface", "dry surface", "compacted",
-            "loose texture",
+            "rough surface", "wet surface", "dry surface",
+            "compacted texture", "loose texture", "powdery surface",
+            "crusted surface",
         ],
         "colors": [
             "beige", "tan", "brown", "dark brown", "reddish-brown",
@@ -277,12 +284,14 @@ CATEGORIES = {
         "nouns": [
             "steel sheet", "iron plate", "copper surface", "brass surface",
             "aluminum panel", "rusted metal", "corroded steel",
-            "galvanized iron", "stainless steel", "bronze",
+            "galvanized iron", "stainless steel", "bronze", "tin plating",
+            "wrought iron", "weathered copper", "polished chrome",
         ],
         "features": [
             "polished surface", "rusted surface", "corroded surface",
-            "brushed finish", "dented", "scratched surface", "reflective",
-            "oxidized",
+            "brushed finish", "dented surface", "scratched surface",
+            "reflective finish", "oxidized coating", "tarnished finish",
+            "pitted surface",
         ],
         "colors": [
             "silver", "gray", "dark gray", "copper", "golden brass",
@@ -317,37 +326,44 @@ CATEGORIES = {
         "nouns": [
             "bread crust", "cake surface", "cheese surface", "dough",
             "rice grains", "pasta surface", "fruit peel", "chocolate",
-            "pizza crust", "biscuit",
+            "pizza crust", "biscuit", "cookie surface", "muffin top",
+            "pastry layers", "cracker surface", "pretzel surface",
+            "sausage skin", "meat surface", "dried fruit",
         ],
         "features": [
             "crumbly surface", "soft texture", "crispy surface",
             "smooth glaze", "flaky layers", "porous texture",
+            "glossy coating", "granular surface", "bubbly surface",
         ],
         "colors": [
             "golden brown", "white", "cream", "dark brown", "yellow",
-            "reddish",
+            "reddish", "orange", "pale beige", "honey-colored",
         ],
         "patterns": [
             "crumb pattern", "porous pattern", "smooth icing",
-            "glazed surface",
+            "glazed surface", "cracked surface", "ridged pattern",
         ],
     },
     "paper_plastic": {
         "nouns": [
             "paper sheet", "cardboard", "plastic surface", "rubber mat",
             "foam sheet", "crumpled paper", "packaging plastic",
-            "fabric-like paper",
+            "fabric-like paper", "tissue paper", "parchment paper",
+            "bubble wrap", "polyethylene film", "recycled cardboard",
+            "cork sheet",
         ],
         "features": [
             "smooth sheet", "crumpled surface", "ribbed surface",
             "porous surface", "glossy finish", "matte finish",
+            "textured surface", "perforated surface", "fibrous surface",
         ],
         "colors": [
             "white", "beige", "gray", "black", "yellow", "transparent",
+            "kraft brown", "pale cream", "recycled gray",
         ],
         "patterns": [
             "corrugated pattern", "smooth sheet", "ribbed lines",
-            "printed pattern",
+            "printed pattern", "crumple pattern", "honeycomb pattern",
         ],
     },
 }
@@ -456,33 +472,31 @@ def extract_ade20k_descriptions(metadata_path: Path) -> list[str]:
 
 def generate_synthetic_for_category(cat: dict, target_count: int,
                                     rng: random.Random) -> list[str]:
-    """Produce up to `target_count` synthetic descriptions for one category
-    via constrained random sampling over (name, features, color, pattern,
-    spatial) tuples. Ensures no cross-category contamination.
+    """Exhaustively enumerate the valid combinatorial space for one category,
+    apply sanity filter, deduplicate, shuffle, and return up to
+    `target_count` descriptions. No cross-category contamination.
 
-    `features` in the output is the concatenation of
-        "<color> <pattern>"  OR  "<color> with <feature adj>"
-    so the output is grammatical.
+    For each (noun, color, pattern, feature, spatial) tuple we emit TWO
+    grammatical framings:
+        "<color> <pattern>"            (pattern-led)
+        "<color> with <feature>"       (feature-led)
+    Max unique per category = |nouns| × |colors| × |patterns| × |features|
+                              × |spatials| × 2.
     """
-    out = set()
-    max_attempts = target_count * 4  # cap to avoid infinite loop if vocab small
-    attempts = 0
-    while len(out) < target_count and attempts < max_attempts:
-        attempts += 1
-        name = rng.choice(cat["nouns"])
-        color = rng.choice(cat["colors"])
-        pattern = rng.choice(cat["patterns"])
-        feat_adj = rng.choice(cat["features"])
-        # Randomly pick one of two grammatical framings
-        if rng.random() < 0.5:
-            features = f"{color} {pattern}"
-        else:
-            features = f"{color} with {feat_adj}"
-        context = rng.choice(SPATIAL_CONTEXTS)
-        text = format_description(name, features, context)
-        if passes_sanity(text):
-            out.add(text)
-    return list(out)
+    combos = []
+    for name, color, pattern, feat, spatial in itertools.product(
+        cat["nouns"], cat["colors"], cat["patterns"], cat["features"],
+        SPATIAL_CONTEXTS,
+    ):
+        combos.append(format_description(name, f"{color} {pattern}", spatial))
+        combos.append(format_description(name, f"{color} with {feat}", spatial))
+
+    sane = [c for c in combos if passes_sanity(c)]
+    unique = list(set(sane))
+    rng.shuffle(unique)
+    if len(unique) > target_count:
+        unique = unique[:target_count]
+    return unique
 
 
 # ===================================================================== #
