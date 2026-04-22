@@ -3,7 +3,7 @@
 Run inference on any test dataset using a saved checkpoint.
 
 Usage:
-    cd /home/aviad/Qwen2SAM_Detecture
+    cd /home/aviad/Detecture/Qwen2SAM_Detecture
     python scripts/test_on_dataset.py \
         --config configs/detecture.yaml \
         --checkpoint checkpoints/best.pt \

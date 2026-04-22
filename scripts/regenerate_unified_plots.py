@@ -409,11 +409,11 @@ def plot_test_metrics(tests, oracle, e2e, plots_dir: Path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--log-dir",
-                   default="/home/aviad/Qwen2SAM_Detecture/checkpoints/logs")
+                   default="/home/aviad/Detecture/Qwen2SAM_Detecture/checkpoints/logs")
     p.add_argument("--plots-dir",
-                   default="/home/aviad/Qwen2SAM_Detecture/checkpoints/plots")
+                   default="/home/aviad/Detecture/Qwen2SAM_Detecture/checkpoints/plots")
     p.add_argument("--test-results-dir",
-                   default="/home/aviad/Qwen2SAM_Detecture/checkpoints/test_results")
+                   default="/home/aviad/Detecture/Qwen2SAM_Detecture/checkpoints/test_results")
     p.add_argument("--skip-run", action="append", default=[],
                    help="Run stem to skip IN ADDITION to DEFAULT_SKIP_RUNS. "
                         "Can repeat.")

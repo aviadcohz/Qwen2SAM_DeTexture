@@ -1,5 +1,7 @@
 # Qwen2SAM-Detecture
 
+> *Part of the [Detecture](../) umbrella — this is the **model** component. The **data pipeline** that produces our training data lives at [../DetectureMiner/](../DetectureMiner/); the **benchmark** that scores us against sibling baselines lives at [../Qwen2SAM_Detecture_Benchmark/](../Qwen2SAM_Detecture_Benchmark/).*
+
 **End-to-End VLM-Guided Multi-Texture Segmentation with [SEG] Token Grounding**
 
 An end-to-end architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a Geometric Segmentation Engine (**SAM 3**) to segment images into 1–6 distinct texture regions. The model uses a dedicated **[SEG] token** to decouple visual grounding from language context, a **block-diagonal attention mask** to prevent cross-texture contamination, and the **Bridge** — a trainable projection into SAM 3's *native* 1024-dim text-encoder space that then reuses SAM's own frozen 1024 → 256 resizer, so Qwen's semantic richness is shape-matched into SAM instead of being squashed through a learned bottleneck.
@@ -516,7 +518,7 @@ training:
 ### Training
 
 ```bash
-cd /home/aviad/Qwen2SAM_Detecture
+cd /home/aviad/Detecture/Qwen2SAM_Detecture
 python -m training.train --config configs/detecture.yaml
 ```
 

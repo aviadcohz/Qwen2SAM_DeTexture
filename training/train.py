@@ -17,7 +17,7 @@ No distillation loss, no InverseProjector, no pre-computed GT embeddings.
 Live Qwen forward in EVERY epoch.
 
 Usage:
-    cd /home/aviad/Qwen2SAM_Detecture
+    cd /home/aviad/Detecture/Qwen2SAM_Detecture
     python -m training.train --config configs/detecture.yaml
 """
 
